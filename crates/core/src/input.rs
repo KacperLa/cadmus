@@ -501,7 +501,39 @@ pub fn parse_device_events(
                 packets.clear();
             }
         } else if evt.kind == EV_KEY {
-            if SLEEP_COVER.contains(&evt.code) {
+            if tagged_evt.is_dynamic {
+                // Track modifier state for dynamic devices
+                match evt.code {
+                    KEY_LEFTCTRL | KEY_RIGHTCTRL => {
+                        ctrl_pressed = evt.value != 0; // true for press (1) and repeat (2), false for release (0)
+                    }
+                    KEY_LEFTSHIFT | KEY_RIGHTSHIFT => {
+                        shift_pressed = evt.value != 0; // true for press (1) and repeat (2), false for release (0)
+                    }
+                    KEY_LEFTALT | KEY_RIGHTALT => {
+                        alt_pressed = evt.value != 0; // true for press (1) and repeat (2), false for release (0)
+                    }
+                    KEY_LEFTMETA | KEY_RIGHTMETA => {
+                        meta_pressed = evt.value != 0; // true for press (1) and repeat (2), false for release (0)
+                    }
+                    _ => {
+                        // For non-modifier keys, send as KeyboardRaw with current modifier state
+                        if let Some(button_status) = ButtonStatus::try_from_raw(evt.value) {
+                            ty.send(DeviceEvent::Button {
+                                time: seconds(evt.time),
+                                code: ButtonCode::KeyboardRaw {
+                                    code: evt.code,
+                                    ctrl: ctrl_pressed,
+                                    shift: shift_pressed,
+                                    alt: alt_pressed,
+                                    meta: meta_pressed,
+                                },
+                                status: button_status,
+                            }).unwrap();
+                        }
+                    }
+                }
+            } else if SLEEP_COVER.contains(&evt.code) {
                 if evt.value == VAL_PRESS {
                     ty.send(DeviceEvent::CoverOn).ok();
                 } else if evt.value == VAL_RELEASE {
