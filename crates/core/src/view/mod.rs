@@ -52,6 +52,7 @@ pub mod settings_editor;
 pub mod sketch;
 pub mod slider;
 pub mod startup;
+pub mod terminal;
 pub mod toggle;
 pub mod toggleable_keyboard;
 pub mod top_bar;
@@ -647,6 +648,7 @@ pub enum AppCmd {
     Calculator,
     Dictionary { query: String, language: String },
     SettingsEditor,
+    Terminal,
     TouchEvents,
     RotationValues,
 }
@@ -725,6 +727,7 @@ pub enum ViewId {
     ReaderSearchInput,
     DictionarySearchInput,
     CalculatorInput,
+    Terminal,
     SearchBar,
     AddressBar,
     AddressBarInput,
