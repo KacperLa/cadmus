@@ -51,6 +51,7 @@ pub mod settings_editor;
 pub mod sketch;
 pub mod slider;
 pub mod startup;
+pub mod terminal;
 pub mod toggle;
 pub mod toggleable_keyboard;
 pub mod top_bar;
@@ -599,6 +600,7 @@ pub enum AppCmd {
     Calculator,
     Dictionary { query: String, language: String },
     SettingsEditor,
+    Terminal,
     TouchEvents,
     RotationValues,
 }
@@ -674,6 +676,7 @@ pub enum ViewId {
     ReaderSearchInput,
     DictionarySearchInput,
     CalculatorInput,
+    Terminal,
     SearchBar,
     AddressBar,
     AddressBarInput,
@@ -737,6 +740,8 @@ pub enum KeyboardEvent {
     Move { target: TextKind, dir: LinearDir },
     Delete { target: TextKind, dir: LinearDir },
     Submit,
+    Raw(&'static [u8]),
+    Control(char),
 }
 
 #[derive(Debug, Copy, Clone)]

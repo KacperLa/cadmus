@@ -43,6 +43,7 @@ use cadmus_core::view::rotation_values::RotationValues;
 use cadmus_core::view::settings_editor::SettingsEditor;
 use cadmus_core::view::sketch::Sketch;
 use cadmus_core::view::startup::StartupScreen;
+use cadmus_core::view::terminal::Terminal;
 use cadmus_core::view::touch_events::TouchEvents;
 use cadmus_core::view::{
     AppCmd, Bus, EntryId, EntryKind, Event, Hub, NotificationEvent, RenderData, RenderQueue,
@@ -600,6 +601,13 @@ pub fn run() -> Result<(), Error> {
                         &mut rq,
                         &mut context,
                     )),
+                    AppCmd::Terminal => Box::new(Terminal::new(
+                        context.device.framebuffer().rect(),
+                        context.settings.terminal.font_size,
+                        &mut rq,
+                        &mut context,
+                        &tx,
+                    )?),
                 };
                 transfer_notifications(view.as_mut(), next_view.as_mut(), &mut rq, &mut context);
                 history.push(HistoryItem {
