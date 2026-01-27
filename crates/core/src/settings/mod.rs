@@ -554,7 +554,7 @@ impl Default for ReaderSettings {
             font_family: DEFAULT_FONT_FAMILY.to_string(),
             font_size: DEFAULT_FONT_SIZE,
             min_font_size: DEFAULT_FONT_SIZE / 2.0,
-            max_font_size: 3.0 * DEFAULT_FONT_SIZE / 2.0,
+            max_font_size: 3.0 * DEFAULT_FONT_SIZE,
             text_align: DEFAULT_TEXT_ALIGN,
             margin_width: DEFAULT_MARGIN_WIDTH,
             min_margin_width: DEFAULT_MARGIN_WIDTH.saturating_sub(8),
