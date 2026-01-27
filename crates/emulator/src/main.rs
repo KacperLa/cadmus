@@ -634,7 +634,7 @@ fn run() -> Result<(), Error> {
                     let mut next_view: Box<dyn View> = match app_cmd {
                         AppCmd::Sketch => {
                             Box::new(Sketch::new(context.fb.rect(), &mut rq, &mut context))
-                        }
+                        },
                         AppCmd::Calculator => Box::new(Calculator::new(
                             context.fb.rect(),
                             &tx,
@@ -657,6 +657,21 @@ fn run() -> Result<(), Error> {
                             &mut rq,
                             &mut context,
                         )),
+                        AppCmd::Terminal => {
+                            match cadmus_core::view::terminal::Terminal::new(
+                                context.fb.rect(),
+                                1024,
+                                &mut rq,
+                                &mut context,
+                                &tx,
+                            ) {
+                                Ok(terminal) => Box::new(terminal),
+                                Err(e) => {
+                                    eprintln!("Failed to create terminal: {}", e);
+                                    continue;
+                                }
+                            }
+                        },
                         AppCmd::TouchEvents => {
                             Box::new(TouchEvents::new(context.fb.rect(), &mut rq, &mut context))
                         }
