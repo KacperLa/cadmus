@@ -660,7 +660,7 @@ fn run() -> Result<(), Error> {
                         AppCmd::Terminal => {
                             match cadmus_core::view::terminal::Terminal::new(
                                 context.fb.rect(),
-                                1024,
+                                context.settings.terminal.font_size,
                                 &mut rq,
                                 &mut context,
                                 &tx,
