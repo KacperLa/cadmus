@@ -4,19 +4,20 @@ use super::{
     pty::Pty,
     render::TerminalRenderer,
 };
+use crate::color::WHITE;
 use crate::context::Context;
 use crate::device::CURRENT_DEVICE;
 use crate::font::Fonts;
 use crate::framebuffer::{Framebuffer, UpdateMode};
-use crate::geom::{CornerSpec, Rectangle, halves, Point};
+use crate::geom::{CornerSpec, Rectangle, Point};
 use crate::unit::scale_by_dpi;
 use crate::view::common::locate_by_id;
 use crate::view::icon::{Icon, ICONS_PIXMAPS};
-use crate::view::keyboard::Keyboard;
 use crate::view::menu::{Menu, MenuKind};
+use crate::view::toggleable_keyboard::ToggleableKeyboard;
 use crate::view::{
     Bus, EntryId, EntryKind, Event, Hub, Id, KeyboardEvent, RenderData, RenderQueue, View, ViewId, ID_FEEDER,
-    BORDER_RADIUS_SMALL, SMALL_BAR_HEIGHT, BIG_BAR_HEIGHT, THICKNESS_MEDIUM,
+    BORDER_RADIUS_SMALL, SMALL_BAR_HEIGHT,
 };
 use anyhow::Result;
 use std::io::Read;
@@ -31,9 +32,12 @@ pub struct Terminal {
     rect: Rectangle,
     children: Vec<Box<dyn View>>,
     double_buffer: Arc<Mutex<DoubleBuffer>>,
+    emulator: Arc<Mutex<Emulator>>,
     pty: Pty,
     shutdown_flag: Arc<AtomicBool>,
     reader_thread: Option<JoinHandle<()>>,
+    keyboard_index: usize,
+    font_size_scaled: u32,
 }
 
 impl Terminal {
@@ -66,28 +70,18 @@ impl Terminal {
         .corners(Some(CornerSpec::Uniform(border_radius)));
         children.push(Box::new(icon) as Box<dyn View>);
         
-        // Add terminal keyboard
-        let big_height = scale_by_dpi(BIG_BAR_HEIGHT, dpi) as i32;
-        let thickness = scale_by_dpi(THICKNESS_MEDIUM, dpi) as i32;
-        let (_, big_thickness) = halves(thickness);
-        
-        let saved_layout = context.settings.keyboard_layout.clone();
-        context.settings.keyboard_layout = "Terminal".to_string();
-        
-        let mut kb_rect = rect![
-            rect.min.x,
-            rect.max.y - (small_height + 3 * big_height) as i32 + big_thickness,
-            rect.max.x,
-            rect.max.y
-        ];
-        let keyboard = Keyboard::new(&mut kb_rect, false, context);
+        // Add toggleable terminal keyboard with Terminal layout (no bottom bar)
+        let mut keyboard = ToggleableKeyboard::new(rect, false)
+            .with_layout("Terminal")
+            .with_bottom_bar(false);
+        let keyboard_height = keyboard.keyboard_height();
+        keyboard.toggle(hub, rq, context);
         children.push(Box::new(keyboard) as Box<dyn View>);
+        let keyboard_index = children.len() - 1;
         
-        context.settings.keyboard_layout = saved_layout;
-        
-        // Calculate terminal grid size based on available screen space
+        // Calculate terminal grid size based on available screen space (with keyboard visible)
         let available_width = rect.width() as i32;
-        let available_height = (kb_rect.min.y - rect.min.y) as i32;
+        let available_height = rect.height() as i32 - keyboard_height;
         let pixmap_width = rect.width();
         let pixmap_height = rect.height();
 
@@ -100,16 +94,24 @@ impl Terminal {
             font_size_scaled,
             &mut context.fonts
         );
+        
+        // Calculate max grid size (full screen without keyboard) for renderer buffer
+        let (max_rows, max_cols) = TerminalRenderer::calculate_grid_for_font_size(
+            rect.width() as i32,
+            rect.height() as i32,
+            font_size_scaled,
+            &mut context.fonts
+        );
  
         let pty = Pty::spawn(Some("/bin/sh"), rows, cols)?;
         let mut reader = pty.take_reader()?;
         let pty_fd = pty.as_raw_fd();
-        let emulator_shared = Arc::new(Mutex::new(Emulator::new(rows, cols)));
+        let emulator = Arc::new(Mutex::new(Emulator::new(rows, cols)));
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         let hub = hub.clone();
         let buffer_shared = Arc::clone(&double_buffer);
-        let emulator_shared = Arc::clone(&emulator_shared);
+        let emulator_shared = Arc::clone(&emulator);
         let shutdown_shared = Arc::clone(&shutdown_flag);
         let font_size_scaled_for_thread = font_size_scaled;
         let reader_thread = std::thread::spawn(move || {
@@ -122,7 +124,8 @@ impl Terminal {
                 }
             };
             
-            let mut renderer = TerminalRenderer::new_with_font_size(&mut fonts, rows, cols, font_size_scaled_for_thread);
+            // Initialize renderer with max grid size to handle keyboard toggle
+            let mut renderer = TerminalRenderer::new_with_font_size(&mut fonts, max_rows, max_cols, font_size_scaled_for_thread);
             let mut buf = [0u8; 4096];
             let mut writer = buffer_writer;
             
@@ -137,6 +140,29 @@ impl Terminal {
             loop {
                 if shutdown_shared.load(Ordering::Acquire) {
                     break;
+                }
+                
+                // Check if we need to clear renderer state and re-render
+                let should_clear = if let Ok(mut double_buf) = buffer_shared.lock() {
+                    double_buf.take_clear_renderer()
+                } else {
+                    false
+                };
+                
+                if should_clear {
+                    writer.back.data.fill(WHITE.gray());
+                    renderer.clear_screen_state();
+                    
+                    if let Ok(mut emu) = emulator_shared.lock() {
+                        let screen = emu.screen();
+                        let dirty_rect = renderer.render_screen(screen, &mut writer.back, &mut fonts);
+                        writer.dirty_rect = dirty_rect;
+
+                        if let Ok(mut double_buf) = buffer_shared.lock() {
+                            double_buf.swap(&mut writer);
+                        }
+                        hub.send(Event::WakeUp).ok();
+                    }
                 }
                 
                 if let Some(ref mut pollfd) = pfd {
@@ -196,12 +222,52 @@ impl Terminal {
             rect,
             children,
             double_buffer,
+            emulator,
             pty,
             shutdown_flag,
             reader_thread: Some(reader_thread),
+            keyboard_index,
+            font_size_scaled,
         };
         
         Ok(terminal)
+    }
+    
+    fn toggle_keyboard(&mut self, hub: &Hub, rq: &mut RenderQueue, context: &mut Context) {
+        if let Some(keyboard) = self.children.get_mut(self.keyboard_index) {
+            if let Some(kb) = keyboard.downcast_mut::<ToggleableKeyboard>() {
+                kb.toggle(hub, rq, context);
+                
+                let keyboard_height = if kb.is_visible() {
+                    kb.keyboard_height()
+                } else {
+                    0
+                };
+                
+                let available_width = self.rect.width() as i32;
+                let available_height = self.rect.height() as i32 - keyboard_height;
+                
+                let (rows, cols) = TerminalRenderer::calculate_grid_for_font_size(
+                    available_width,
+                    available_height,
+                    self.font_size_scaled,
+                    &mut context.fonts
+                );
+                
+                if let Err(e) = self.pty.resize(rows, cols) {
+                    eprintln!("Failed to resize PTY: {}", e);
+                }
+                
+                if let Ok(mut emu) = self.emulator.lock() {
+                    emu.resize(rows, cols);
+                }
+                
+                if let Ok(mut buffer) = self.double_buffer.lock() {
+                    buffer.request_clear_renderer();
+                    buffer.request_full_refresh();
+                }
+            }
+        }
     }
     
     fn toggle_title_menu(
@@ -224,6 +290,7 @@ impl Terminal {
             }
             
             let entries = vec![
+                EntryKind::Command("Toggle Keyboard".to_string(), EntryId::ToggleKeyboard),
                 EntryKind::Command("Quit".to_string(), EntryId::Quit),
             ];
             let menu = Menu::new(rect, ViewId::TitleMenu, MenuKind::Contextual, entries, context);
@@ -265,6 +332,10 @@ impl View for Terminal {
             }
             Event::ToggleNear(ViewId::TitleMenu, rect) => {
                 self.toggle_title_menu(rect, None, rq, context);
+                true
+            }
+            Event::Select(EntryId::ToggleKeyboard) => {
+                self.toggle_keyboard(hub, rq, context);
                 true
             }
             Event::Select(EntryId::Quit) => {

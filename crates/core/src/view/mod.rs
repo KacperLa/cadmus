@@ -650,6 +650,7 @@ pub enum EntryId {
     Reboot,
     Quit,
     CheckForUpdates,
+    ToggleKeyboard,
 }
 
 impl EntryKind {
