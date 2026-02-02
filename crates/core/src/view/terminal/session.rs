@@ -27,6 +27,11 @@ use std::thread::JoinHandle;
 
 const ICON_NAME: &str = "enclosed_menu";
 
+#[inline]
+fn scale_font_size(font_size: f32) -> u32 {
+    (font_size * 64.0) as u32
+}
+
 pub struct Terminal {
     id: Id,
     rect: Rectangle,
@@ -45,7 +50,7 @@ impl Terminal {
         let id = ID_FEEDER.next();
         let mut children = Vec::new();
         let dpi = CURRENT_DEVICE.dpi;
-        let font_size_scaled = (font_size * 64.0) as u32;
+        let font_size_scaled = scale_font_size(font_size);
         
         // Setup menu icon in top right corner
         let small_height = scale_by_dpi(SMALL_BAR_HEIGHT, dpi) as i32;
