@@ -1,8 +1,8 @@
 use crate::device::CURRENT_DEVICE;
-use crate::geom::{elbow, nearest_segment_point, Axis, DiagDir, Dir, Point, Vec2};
+use crate::geom::{elbow, nearest_segment_point, Axis, DiagDir, Dir, LinearDir, Point, Vec2};
 use crate::input::{ButtonCode, ButtonStatus, DeviceEvent, FingerStatus};
 use crate::unit::mm_to_px;
-use crate::view::Event;
+use crate::view::{Event, KeyboardEvent, TextKind};
 use fxhash::FxHashMap;
 use std::f64;
 use std::fmt;
@@ -122,6 +122,87 @@ pub struct TouchState {
     time: f64,
     held: bool,
     positions: Vec<Point>,
+}
+
+fn keycode_to_keyboard_event(code: u16, ctrl: bool, shift: bool) -> Option<KeyboardEvent> {
+    match code {
+        // Letters (a-z)
+        30 => Some(KeyboardEvent::Append(if shift { 'A' } else { 'a' })),
+        48 => Some(KeyboardEvent::Append(if shift { 'B' } else { 'b' })),
+        46 => Some(KeyboardEvent::Append(if shift { 'C' } else { 'c' })),
+        32 => Some(KeyboardEvent::Append(if shift { 'D' } else { 'd' })),
+        18 => Some(KeyboardEvent::Append(if shift { 'E' } else { 'e' })),
+        33 => Some(KeyboardEvent::Append(if shift { 'F' } else { 'f' })),
+        34 => Some(KeyboardEvent::Append(if shift { 'G' } else { 'g' })),
+        35 => Some(KeyboardEvent::Append(if shift { 'H' } else { 'h' })),
+        23 => Some(KeyboardEvent::Append(if shift { 'I' } else { 'i' })),
+        36 => Some(KeyboardEvent::Append(if shift { 'J' } else { 'j' })),
+        37 => Some(KeyboardEvent::Append(if shift { 'K' } else { 'k' })),
+        38 => Some(KeyboardEvent::Append(if shift { 'L' } else { 'l' })),
+        50 => Some(KeyboardEvent::Append(if shift { 'M' } else { 'm' })),
+        49 => Some(KeyboardEvent::Append(if shift { 'N' } else { 'n' })),
+        24 => Some(KeyboardEvent::Append(if shift { 'O' } else { 'o' })),
+        25 => Some(KeyboardEvent::Append(if shift { 'P' } else { 'p' })),
+        16 => Some(KeyboardEvent::Append(if shift { 'Q' } else { 'q' })),
+        19 => Some(KeyboardEvent::Append(if shift { 'R' } else { 'r' })),
+        31 => Some(KeyboardEvent::Append(if shift { 'S' } else { 's' })),
+        20 => Some(KeyboardEvent::Append(if shift { 'T' } else { 't' })),
+        22 => Some(KeyboardEvent::Append(if shift { 'U' } else { 'u' })),
+        47 => Some(KeyboardEvent::Append(if shift { 'V' } else { 'v' })),
+        17 => Some(KeyboardEvent::Append(if shift { 'W' } else { 'w' })),
+        45 => Some(KeyboardEvent::Append(if shift { 'X' } else { 'x' })),
+        21 => Some(KeyboardEvent::Append(if shift { 'Y' } else { 'y' })),
+        44 => Some(KeyboardEvent::Append(if shift { 'Z' } else { 'z' })),
+        
+        // Numbers
+        2  => Some(KeyboardEvent::Append(if shift { '!' } else { '1' })),
+        3  => Some(KeyboardEvent::Append(if shift { '@' } else { '2' })),
+        4  => Some(KeyboardEvent::Append(if shift { '#' } else { '3' })),
+        5  => Some(KeyboardEvent::Append(if shift { '$' } else { '4' })),
+        6  => Some(KeyboardEvent::Append(if shift { '%' } else { '5' })),
+        7  => Some(KeyboardEvent::Append(if shift { '^' } else { '6' })),
+        8  => Some(KeyboardEvent::Append(if shift { '&' } else { '7' })),
+        9  => Some(KeyboardEvent::Append(if shift { '*' } else { '8' })),
+        10 => Some(KeyboardEvent::Append(if shift { '(' } else { '9' })),
+        11 => Some(KeyboardEvent::Append(if shift { ')' } else { '0' })),
+        
+        57 => Some(KeyboardEvent::Append(' ')),
+        28 => Some(KeyboardEvent::Submit),
+        15 => Some(KeyboardEvent::Raw(b"\t")),
+        1  => Some(KeyboardEvent::Raw(b"\x1b")),
+        
+        14 => Some(KeyboardEvent::Delete { target: TextKind::Char, dir: LinearDir::Backward }),
+        
+        103 => Some(KeyboardEvent::Raw(b"\x1b[A")),
+        108 => Some(KeyboardEvent::Raw(b"\x1b[B")),
+        106 => Some(KeyboardEvent::Raw(b"\x1b[C")),
+        105 => Some(KeyboardEvent::Raw(b"\x1b[D")),
+        
+        12 => Some(KeyboardEvent::Append(if shift { '_' } else { '-' })),
+        13 => Some(KeyboardEvent::Append(if shift { '+' } else { '=' })),
+        26 => Some(KeyboardEvent::Append(if shift { '{' } else { '[' })),
+        27 => Some(KeyboardEvent::Append(if shift { '}' } else { ']' })),
+        43 => Some(KeyboardEvent::Append(if shift { '|' } else { '\\' })),
+        39 => Some(KeyboardEvent::Append(if shift { ':' } else { ';' })),
+        40 => Some(KeyboardEvent::Append(if shift { '"' } else { '\'' })),
+        41 => Some(KeyboardEvent::Append(if shift { '~' } else { '`' })),
+        51 => Some(KeyboardEvent::Append(if shift { '<' } else { ',' })),
+        52 => Some(KeyboardEvent::Append(if shift { '>' } else { '.' })),
+        53 => Some(KeyboardEvent::Append(if shift { '?' } else { '/' })),
+        
+        _ => None,
+    }.map(|ke| {
+        if ctrl {
+            match ke {
+                KeyboardEvent::Append(ch) if ch.is_ascii_alphabetic() => {
+                    KeyboardEvent::Control(ch)
+                }
+                _ => ke,
+            }
+        } else {
+            ke
+        }
+    })
 }
 
 pub fn gesture_events(rx: Receiver<DeviceEvent>) -> Receiver<Event> {
@@ -494,32 +575,39 @@ pub fn parse_gesture_events(rx: &Receiver<DeviceEvent>, ty: &Sender<Event>) {
                 code,
                 time,
             } => {
-                let mut bt = buttons.lock().unwrap();
-                bt.insert(code, time);
-                let ty = ty.clone();
-                let buttons = buttons.clone();
-                thread::spawn(move || {
-                    thread::sleep(HOLD_DELAY_SHORT);
-                    {
-                        let bt = buttons.lock().unwrap();
-                        if let Some(&initial_time) = bt.get(&code) {
-                            if (initial_time - time).abs() < f64::EPSILON {
-                                ty.send(Event::Gesture(GestureEvent::HoldButtonShort(code)))
-                                    .ok();
+                // Convert keyboard raw events to keyboard events
+                if let ButtonCode::KeyboardRaw { code: keycode, ctrl, shift, .. } = code {
+                    if let Some(ke) = keycode_to_keyboard_event(keycode, ctrl, shift) {
+                        ty.send(Event::Keyboard(ke)).ok();
+                    }
+                } else {
+                    let mut bt = buttons.lock().unwrap();
+                    bt.insert(code, time);
+                    let ty = ty.clone();
+                    let buttons = buttons.clone();
+                    thread::spawn(move || {
+                        thread::sleep(HOLD_DELAY_SHORT);
+                        {
+                            let bt = buttons.lock().unwrap();
+                            if let Some(&initial_time) = bt.get(&code) {
+                                if (initial_time - time).abs() < f64::EPSILON {
+                                    ty.send(Event::Gesture(GestureEvent::HoldButtonShort(code)))
+                                        .ok();
+                                }
                             }
                         }
-                    }
-                    thread::sleep(HOLD_DELAY_LONG - HOLD_DELAY_SHORT);
-                    {
-                        let bt = buttons.lock().unwrap();
-                        if let Some(&initial_time) = bt.get(&code) {
-                            if (initial_time - time).abs() < f64::EPSILON {
-                                ty.send(Event::Gesture(GestureEvent::HoldButtonLong(code)))
-                                    .ok();
+                        thread::sleep(HOLD_DELAY_LONG - HOLD_DELAY_SHORT);
+                        {
+                            let bt = buttons.lock().unwrap();
+                            if let Some(&initial_time) = bt.get(&code) {
+                                if (initial_time - time).abs() < f64::EPSILON {
+                                    ty.send(Event::Gesture(GestureEvent::HoldButtonLong(code)))
+                                        .ok();
+                                }
                             }
                         }
-                    }
-                });
+                    });
+                }
             }
             DeviceEvent::Button {
                 status: ButtonStatus::Released,

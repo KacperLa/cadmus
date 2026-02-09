@@ -5,7 +5,6 @@ use crate::settings::ButtonScheme;
 use anyhow::{Context, Error};
 use fxhash::FxHashMap;
 use nix::{ioctl_read, ioctl_read_buf};
-use serde::Serialize;
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::File;
@@ -15,6 +14,7 @@ use std::os::unix::io::AsRawFd;
 use std::ptr;
 use std::slice;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -111,6 +111,36 @@ pub struct InputEvent {
 pub struct TaggedInputEvent {
     pub event: InputEvent,
     pub is_dynamic: bool, // true for hotplugged devices, false for static devices
+}
+
+// Wrapper for keyboard device files that logs cleanup
+struct KeyboardDevice {
+    file: File,
+    path: String,
+}
+
+impl KeyboardDevice {
+    fn new(file: File, path: String) -> Self {
+        Self { file, path }
+    }
+}
+
+impl Drop for KeyboardDevice {
+    fn drop(&mut self) {
+        eprintln!("Closing file descriptor for {}", self.path);
+    }
+}
+
+impl Read for KeyboardDevice {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl AsRawFd for KeyboardDevice {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.file.as_raw_fd()
+    }
 }
 
 // Handle different touch protocols
@@ -390,14 +420,16 @@ fn scan_dynamic_keyboards(static_paths: &[String], existing_dynamic: &[String], 
     keyboards
 }
 
-pub fn raw_events(paths: Vec<String>) -> (Sender<TaggedInputEvent>, Receiver<TaggedInputEvent>) {
+pub fn raw_events(paths: Vec<String>) -> (Sender<TaggedInputEvent>, Receiver<TaggedInputEvent>, Arc<AtomicBool>, thread::JoinHandle<Option<()>>) {
     let (tx, rx) = mpsc::channel();
     let tx_for_thread = tx.clone();
-    thread::spawn(move || parse_raw_events(&paths, &tx_for_thread).ok());
-    (tx, rx)
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_thread = Arc::clone(&shutdown);
+    let handle = thread::spawn(move || parse_raw_events(&paths, &tx_for_thread, &shutdown_thread).ok());
+    (tx, rx, shutdown, handle)
 }
 
-fn parse_raw_events(paths: &[String], tx: &Sender<TaggedInputEvent>) -> Result<(), Error> {
+fn parse_raw_events(paths: &[String], tx: &Sender<TaggedInputEvent>, shutdown: &Arc<AtomicBool>) -> Result<(), Error> {
     // Static devices: always open, never close
     let mut static_files = Vec::new();
     let mut static_pfds = Vec::new();
@@ -416,7 +448,7 @@ fn parse_raw_events(paths: &[String], tx: &Sender<TaggedInputEvent>) -> Result<(
     }
     
     // Dynamic devices: hotplugged keyboards
-    let mut dynamic_files: Vec<File> = Vec::new();
+    let mut dynamic_files: Vec<KeyboardDevice> = Vec::new();
     let mut dynamic_pfds: Vec<libc::pollfd> = Vec::new();
     let mut dynamic_paths: Vec<String> = Vec::new();
     
@@ -428,6 +460,11 @@ fn parse_raw_events(paths: &[String], tx: &Sender<TaggedInputEvent>) -> Result<(
     const SCAN_INTERVAL: Duration = Duration::from_secs(5);
     
     loop {
+        if shutdown.load(Ordering::Acquire) {
+            eprintln!("Input thread shutdown requested");
+            break;
+        }
+        
         // Scan for new devices periodically
         if last_scan.elapsed() >= SCAN_INTERVAL {
             last_scan = Instant::now();
@@ -441,7 +478,7 @@ fn parse_raw_events(paths: &[String], tx: &Sender<TaggedInputEvent>) -> Result<(
                         events: libc::POLLIN,
                         revents: 0,
                     });
-                    dynamic_files.push(file);
+                    dynamic_files.push(KeyboardDevice::new(file, path.clone()));
                     dynamic_paths.push(path.clone());
                     eprintln!("Hotplug: opened keyboard device {}", path);
                 }
@@ -452,17 +489,24 @@ fn parse_raw_events(paths: &[String], tx: &Sender<TaggedInputEvent>) -> Result<(
         let mut all_pfds: Vec<libc::pollfd> = static_pfds.clone();
         all_pfds.extend(dynamic_pfds.iter().cloned());
         
-        // Calculate timeout until next scan
+        // Use short timeout for responsive shutdown detection
+        const MAX_POLL_TIMEOUT_MS: i32 = 100;
         let elapsed = last_scan.elapsed();
         let timeout_ms = if elapsed >= SCAN_INTERVAL {
             0
         } else {
-            SCAN_INTERVAL.saturating_sub(elapsed).as_millis() as i32
+            let remaining = SCAN_INTERVAL.saturating_sub(elapsed).as_millis() as i32;
+            remaining.min(MAX_POLL_TIMEOUT_MS)
         };
         
         let ret = unsafe { libc::poll(all_pfds.as_mut_ptr(), all_pfds.len() as libc::nfds_t, timeout_ms) };
         if ret < 0 {
+            eprintln!("Poll error in raw_events, cleaning up");
             break;
+        }
+        
+        if ret == 0 {
+            continue;
         }
         
         // Process static device events (indices 0..static_pfds.len())
@@ -477,10 +521,14 @@ fn parse_raw_events(paths: &[String], tx: &Sender<TaggedInputEvent>) -> Result<(
                     if static_files[i].read_exact(event_slice).is_err() {
                         continue;
                     }
-                    tx.send(TaggedInputEvent {
+                    if tx.send(TaggedInputEvent {
                         event: input_event.assume_init(),
                         is_dynamic: false,
-                    }).ok();
+                    }).is_err() {
+                        // Channel disconnected, exit gracefully
+                        eprintln!("Input channel disconnected during static device event send");
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -501,10 +549,14 @@ fn parse_raw_events(paths: &[String], tx: &Sender<TaggedInputEvent>) -> Result<(
                         to_remove.push(i);
                         continue;
                     }
-                    tx.send(TaggedInputEvent {
+                    if tx.send(TaggedInputEvent {
                         event: input_event.assume_init(),
                         is_dynamic: true,
-                    }).ok();
+                    }).is_err() {
+                        // Channel disconnected, exit gracefully
+                        eprintln!("Input channel disconnected during dynamic device event send");
+                        return Ok(());
+                    }
                 }
             } else if pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
                 to_remove.push(i);
@@ -520,16 +572,19 @@ fn parse_raw_events(paths: &[String], tx: &Sender<TaggedInputEvent>) -> Result<(
         }
     }
     
+    // Let process termination handle cleanup - explicit cleanup may interfere with Nickel
     Ok(())
 }
 
-pub fn usb_events() -> Receiver<DeviceEvent> {
+pub fn usb_events() -> (Receiver<DeviceEvent>, Arc<AtomicBool>, thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
-    thread::spawn(move || parse_usb_events(&tx));
-    rx
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_thread = Arc::clone(&shutdown);
+    let handle = thread::spawn(move || parse_usb_events(&tx, &shutdown_thread));
+    (rx, shutdown, handle)
 }
 
-fn parse_usb_events(tx: &Sender<DeviceEvent>) {
+fn parse_usb_events(tx: &Sender<DeviceEvent>, shutdown: &Arc<AtomicBool>) {
     let path = CString::new("/tmp/nickel-hardware-status").unwrap();
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_NONBLOCK | libc::O_RDWR) };
 
@@ -544,12 +599,22 @@ fn parse_usb_events(tx: &Sender<DeviceEvent>) {
     };
 
     const BUF_LEN: usize = 256;
+    const POLL_TIMEOUT_MS: i32 = 100;
 
     loop {
-        let ret = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, -1) };
+        if shutdown.load(Ordering::Acquire) {
+            eprintln!("USB thread shutdown requested");
+            break;
+        }
+        
+        let ret = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, POLL_TIMEOUT_MS) };
 
         if ret < 0 {
             break;
+        }
+        
+        if ret == 0 {
+            continue;
         }
 
         let buf = CString::new(vec![1; BUF_LEN]).unwrap();
@@ -579,6 +644,7 @@ fn parse_usb_events(tx: &Sender<DeviceEvent>) {
             }
         }
     }
+    // Let process termination handle fd cleanup - explicit close may interfere with Nickel
 }
 
 pub fn device_events(rx: Receiver<TaggedInputEvent>, display: Display, button_scheme: ButtonScheme) -> Receiver<DeviceEvent> {

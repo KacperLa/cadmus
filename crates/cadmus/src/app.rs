@@ -311,13 +311,13 @@ pub fn run() -> Result<(), Error> {
         }
     }
 
-    let (raw_sender, raw_receiver) = raw_events(paths);
+    let (raw_sender, raw_receiver, input_shutdown, input_thread) = raw_events(paths);
     let touch_screen = gesture_events(device_events(
         raw_receiver,
         context.display,
         context.settings.button_scheme,
     ));
-    let usb_port = usb_events();
+    let (usb_port, usb_shutdown, usb_thread) = usb_events();
 
     let (tx, rx) = mpsc::channel();
     let tx2 = tx.clone();
@@ -1324,14 +1324,29 @@ pub fn run() -> Result<(), Error> {
                 view.children_mut().push(Box::new(notif) as Box<dyn View>);
             }
             Event::Select(EntryId::Restart) => {
+                eprintln!("Restart requested, closing input thread");
+                input_shutdown.store(true, std::sync::atomic::Ordering::Release);
+                usb_shutdown.store(true, std::sync::atomic::Ordering::Release);
+                input_thread.join().ok();
+                usb_thread.join().ok();
                 exit_status = ExitStatus::Restart;
                 break;
             }
             Event::Select(EntryId::Reboot) => {
+                eprintln!("Reboot requested, closing input thread");
+                input_shutdown.store(true, std::sync::atomic::Ordering::Release);
+                usb_shutdown.store(true, std::sync::atomic::Ordering::Release);
+                input_thread.join().ok();
+                usb_thread.join().ok();
                 exit_status = ExitStatus::Reboot;
                 break;
             }
             Event::Select(EntryId::Quit) => {
+                eprintln!("Quit requested, closing input thread");
+                input_shutdown.store(true, std::sync::atomic::Ordering::Release);
+                usb_shutdown.store(true, std::sync::atomic::Ordering::Release);
+                input_thread.join().ok();
+                usb_thread.join().ok();
                 break;
             }
             Event::MightSuspend if context.settings.auto_suspend > 0.0 => {
