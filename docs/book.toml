@@ -6,6 +6,15 @@ language = "en"
 build-dir = "book"
 create-missing = true
 
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[preprocessor.mermaid-png]
+command = "python3 mdbook-mermaid-preprocessor.py"
+renderer = ["epub"]
+
 [output.epub]
 
 [output.html]
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+additional-css = ["custom.css"]
