@@ -53,7 +53,7 @@ pub fn current_version() -> Result<String> {
     let content = std::fs::read_to_string(&cargo_toml_path)
         .with_context(|| format!("failed to read {}", cargo_toml_path.display()))?;
 
-    let doc: toml::Value = content
+    let doc: toml::Table = content
         .parse()
         .with_context(|| format!("failed to parse {}", cargo_toml_path.display()))?;
 
