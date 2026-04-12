@@ -1,7 +1,7 @@
 use crate::color::WHITE;
 use crate::font::Fonts;
 use crate::framebuffer::Framebuffer;
-use crate::geom::Rectangle;
+use crate::geom::{CycleDir, Rectangle};
 use crate::view::filler::Filler;
 use crate::view::icon::Icon;
 use crate::view::{Event, Id, View, ID_FEEDER};
@@ -26,6 +26,20 @@ pub enum BottomBarVariant {
         right_event: Event,
         /// Icon name for right button
         right_icon: &'static str,
+    },
+    /// Navigation bar with prev/next arrows and a center action button.
+    /// Used for Libraries pagination: prev | center icon | next.
+    PaginationWithButton {
+        prev_enabled: bool,
+        next_enabled: bool,
+        center_event: Event,
+        center_icon: &'static str,
+    },
+    /// Navigation bar with prev/next arrows only (no center content).
+    /// Used for non-Libraries pagination: prev | spacer | next.
+    Pagination {
+        prev_enabled: bool,
+        next_enabled: bool,
     },
 }
 
@@ -67,6 +81,7 @@ impl SettingsEditorBottomBar {
     ///     },
     /// );
     /// ```
+    #[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
     pub fn new(rect: Rectangle, variant: BottomBarVariant) -> Self {
         let id = ID_FEEDER.next();
         let mut children = Vec::new();
@@ -108,9 +123,68 @@ impl SettingsEditorBottomBar {
                 let right_button = Icon::new(right_icon, right_rect, right_event);
                 children.push(Box::new(right_button) as Box<dyn View>);
             }
+            BottomBarVariant::PaginationWithButton {
+                prev_enabled,
+                next_enabled,
+                center_event,
+                center_icon,
+            } => {
+                let (left_rect, center_rect, right_rect) = Self::pagination_rects(rect);
+                Self::push_prev_arrow(&mut children, left_rect, prev_enabled);
+                children
+                    .push(Box::new(Icon::new(center_icon, center_rect, center_event))
+                        as Box<dyn View>);
+                Self::push_next_arrow(&mut children, right_rect, next_enabled);
+            }
+            BottomBarVariant::Pagination {
+                prev_enabled,
+                next_enabled,
+            } => {
+                let (left_rect, center_rect, right_rect) = Self::pagination_rects(rect);
+                Self::push_prev_arrow(&mut children, left_rect, prev_enabled);
+                children.push(Box::new(Filler::new(center_rect, WHITE)) as Box<dyn View>);
+                Self::push_next_arrow(&mut children, right_rect, next_enabled);
+            }
         }
 
         SettingsEditorBottomBar { id, rect, children }
+    }
+
+    /// Splits `rect` into equal left, center, and right thirds for pagination layouts.
+    fn pagination_rects(rect: Rectangle) -> (Rectangle, Rectangle, Rectangle) {
+        let third_width = rect.width() as i32 / 3;
+        let left_rect = rect![rect.min.x, rect.min.y, rect.min.x + third_width, rect.max.y];
+        let center_rect = rect![
+            rect.min.x + third_width,
+            rect.min.y,
+            rect.max.x - third_width,
+            rect.max.y
+        ];
+        let right_rect = rect![rect.max.x - third_width, rect.min.y, rect.max.x, rect.max.y];
+        (left_rect, center_rect, right_rect)
+    }
+
+    fn push_prev_arrow(children: &mut Vec<Box<dyn View>>, rect: Rectangle, enabled: bool) {
+        if enabled {
+            children.push(Box::new(Icon::new(
+                "arrow-left",
+                rect,
+                Event::Page(CycleDir::Previous),
+            )) as Box<dyn View>);
+        } else {
+            children.push(Box::new(Filler::new(rect, WHITE)) as Box<dyn View>);
+        }
+    }
+
+    fn push_next_arrow(children: &mut Vec<Box<dyn View>>, rect: Rectangle, enabled: bool) {
+        if enabled {
+            children.push(
+                Box::new(Icon::new("arrow-right", rect, Event::Page(CycleDir::Next)))
+                    as Box<dyn View>,
+            );
+        } else {
+            children.push(Box::new(Filler::new(rect, WHITE)) as Box<dyn View>);
+        }
     }
 }
 
