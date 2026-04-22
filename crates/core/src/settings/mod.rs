@@ -25,15 +25,18 @@ pub const INTERNAL_CARD_ROOT: &str = "/mnt/onboard";
 pub const EXTERNAL_CARD_ROOT: &str = "/mnt/sd";
 const LOGO_SPECIAL_PATH: &str = "logo:";
 const COVER_SPECIAL_PATH: &str = "cover:";
+const CALENDAR_SPECIAL_PATH: &str = "calendar:";
 
 /// How to display intermission screens.
-/// Logo and Cover are special values that map to built-in images.
+/// Logo, Cover and Calendar are special values that map to built-in displays.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum IntermissionDisplay {
     /// Display the built-in logo image.
     Logo,
     /// Display the cover of the currently reading book.
     Cover,
+    /// Display the built-in calendar view.
+    Calendar,
     /// Display a custom image from the given path.
     Image(PathBuf),
 }
@@ -46,6 +49,7 @@ impl Serialize for IntermissionDisplay {
         match self {
             IntermissionDisplay::Logo => serializer.serialize_str(LOGO_SPECIAL_PATH),
             IntermissionDisplay::Cover => serializer.serialize_str(COVER_SPECIAL_PATH),
+            IntermissionDisplay::Calendar => serializer.serialize_str(CALENDAR_SPECIAL_PATH),
             IntermissionDisplay::Image(path) => {
                 serializer.serialize_str(path.to_string_lossy().as_ref())
             }
@@ -62,6 +66,7 @@ impl<'de> Deserialize<'de> for IntermissionDisplay {
         Ok(match s.as_str() {
             LOGO_SPECIAL_PATH => IntermissionDisplay::Logo,
             COVER_SPECIAL_PATH => IntermissionDisplay::Cover,
+            CALENDAR_SPECIAL_PATH => IntermissionDisplay::Calendar,
             _ => IntermissionDisplay::Image(PathBuf::from(s)),
         })
     }
@@ -72,8 +77,20 @@ impl fmt::Display for IntermissionDisplay {
         match self {
             IntermissionDisplay::Logo => write!(f, "Logo"),
             IntermissionDisplay::Cover => write!(f, "Cover"),
+            IntermissionDisplay::Calendar => write!(f, "Calendar"),
             IntermissionDisplay::Image(_) => write!(f, "Custom"),
         }
+    }
+}
+
+impl IntermissionDisplay {
+    /// Returns whether this display mode is supported for the given intermission kind.
+    pub fn is_supported_for(&self, kind: IntermKind) -> bool {
+        if !matches!(self, IntermissionDisplay::Calendar) {
+            return true;
+        }
+
+        kind.supports_calendar()
     }
 }
 
@@ -136,6 +153,10 @@ impl IntermKind {
             IntermKind::Share => "Shared",
         }
     }
+
+    pub fn supports_calendar(self) -> bool {
+        matches!(self, IntermKind::Suspend)
+    }
 }
 
 /// Configuration for intermission screen displays.
@@ -166,6 +187,42 @@ impl IndexMut<IntermKind> for Intermissions {
             IntermKind::PowerOff => &mut self.power_off,
             IntermKind::Share => &mut self.share,
         }
+    }
+}
+
+impl Intermissions {
+    /// Updates an intermission display when the selected mode is valid for the target kind.
+    pub fn set_display(&mut self, kind: IntermKind, display: IntermissionDisplay) -> bool {
+        if !display.is_supported_for(kind) {
+            return false;
+        }
+
+        self[kind] = display;
+        true
+    }
+
+    /// Replaces unsupported intermission modes with the default logo display.
+    pub fn sanitize(&mut self) -> bool {
+        let mut changed = false;
+
+        changed |= self.sanitize_kind(IntermKind::Suspend);
+        changed |= self.sanitize_kind(IntermKind::PowerOff);
+        changed |= self.sanitize_kind(IntermKind::Share);
+
+        if changed {
+            eprintln!("ignoring unsupported calendar intermissions for power-off/share; using logo instead");
+        }
+
+        changed
+    }
+
+    fn sanitize_kind(&mut self, kind: IntermKind) -> bool {
+        if self[kind].is_supported_for(kind) {
+            return false;
+        }
+
+        self[kind] = IntermissionDisplay::Logo;
+        true
     }
 }
 
@@ -206,6 +263,13 @@ pub struct Settings {
     pub settings_retention: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub locale: Option<LanguageIdentifier>,
+}
+
+impl Settings {
+    /// Normalizes unsupported settings values loaded from disk.
+    pub fn sanitize(&mut self) -> bool {
+        self.intermissions.sanitize()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -804,5 +868,49 @@ share = "/path/to/custom.png"
             original.share, deserialized.share,
             "share should survive round trip"
         );
+    }
+
+    #[test]
+    fn test_intermissions_reject_unsupported_calendar_selection() {
+        let mut intermissions = Intermissions {
+            suspend: IntermissionDisplay::Logo,
+            power_off: IntermissionDisplay::Logo,
+            share: IntermissionDisplay::Logo,
+        };
+
+        assert!(!intermissions.set_display(IntermKind::PowerOff, IntermissionDisplay::Calendar));
+        assert!(!intermissions.set_display(IntermKind::Share, IntermissionDisplay::Calendar));
+        assert!(intermissions.set_display(IntermKind::Suspend, IntermissionDisplay::Calendar));
+
+        assert_eq!(
+            intermissions[IntermKind::PowerOff],
+            IntermissionDisplay::Logo
+        );
+        assert_eq!(intermissions[IntermKind::Share], IntermissionDisplay::Logo);
+        assert_eq!(
+            intermissions[IntermKind::Suspend],
+            IntermissionDisplay::Calendar
+        );
+    }
+
+    #[test]
+    fn test_intermissions_sanitize_replaces_unsupported_calendar() {
+        let mut intermissions = Intermissions {
+            suspend: IntermissionDisplay::Calendar,
+            power_off: IntermissionDisplay::Calendar,
+            share: IntermissionDisplay::Calendar,
+        };
+
+        assert!(intermissions.sanitize());
+
+        assert_eq!(
+            intermissions[IntermKind::Suspend],
+            IntermissionDisplay::Calendar
+        );
+        assert_eq!(
+            intermissions[IntermKind::PowerOff],
+            IntermissionDisplay::Logo
+        );
+        assert_eq!(intermissions[IntermKind::Share], IntermissionDisplay::Logo);
     }
 }

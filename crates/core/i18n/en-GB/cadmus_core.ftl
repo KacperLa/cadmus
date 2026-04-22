@@ -60,6 +60,7 @@ settings-intermission-power-off-screen = Power Off Screen
 settings-intermission-share-screen = Share Screen
 settings-intermission-logo = Logo
 settings-intermission-cover = Cover
+settings-intermission-calendar = Calendar
 settings-intermission-custom-image = Custom Image...
 settings-intermission-custom = Custom
 
@@ -95,3 +96,41 @@ settings-dictionaries-installed = Installed
 settings-dictionaries-download = Download
 settings-dictionaries-update = Update
 settings-dictionaries-update-available = Update Available
+
+# Calendar intermission
+calendar-date-line = { $day } { $month } { $year } - { $weekday }
+calendar-poweroff = Auto power off in { $duration }
+
+calendar-month-january = January
+calendar-month-february = February
+calendar-month-march = March
+calendar-month-april = April
+calendar-month-may = May
+calendar-month-june = June
+calendar-month-july = July
+calendar-month-august = August
+calendar-month-september = September
+calendar-month-october = October
+calendar-month-november = November
+calendar-month-december = December
+
+calendar-month-short-jan = JAN
+calendar-month-short-feb = FEB
+calendar-month-short-mar = MAR
+calendar-month-short-apr = APR
+calendar-month-short-may = MAY
+calendar-month-short-jun = JUN
+calendar-month-short-jul = JUL
+calendar-month-short-aug = AUG
+calendar-month-short-sep = SEP
+calendar-month-short-oct = OCT
+calendar-month-short-nov = NOV
+calendar-month-short-dec = DEC
+
+calendar-weekday-mon = MON
+calendar-weekday-tue = TUE
+calendar-weekday-wed = WED
+calendar-weekday-thu = THU
+calendar-weekday-fri = FRI
+calendar-weekday-sat = SAT
+calendar-weekday-sun = SUN

@@ -191,7 +191,11 @@ share = "logo:"
 
 Image displayed when the device enters sleep mode.
 
-- Possible values: `"logo:"` (built-in logo), `"cover:"` (current book cover), or a path to a custom image file.
+Setting this to `"calendar:"` also enables the calendar refresh: every 5
+minutes, the device wakes, shows the calendar, and then goes back to sleep
+automatically.
+
+- Possible values: `"logo:"` (built-in logo), `"cover:"` (current book cover), `"calendar:"` (built-in calendar), or a path to a custom image file.
 
 ### `intermissions.power-off`
 
