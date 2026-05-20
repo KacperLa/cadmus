@@ -311,6 +311,11 @@ fn git_clone_tag(repo: &str, tag: &str, dest: &Path) -> Result<()> {
         std::fs::read_dir(&tmp).with_context(|| format!("failed to read {}", tmp.display()))?
     {
         let entry = entry.with_context(|| format!("failed to read entry in {}", tmp.display()))?;
+
+        if entry.file_name() == ".git" {
+            continue;
+        }
+
         let target = dest.join(entry.file_name());
         if target.exists() {
             if target.is_dir() {
