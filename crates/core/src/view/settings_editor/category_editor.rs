@@ -601,6 +601,7 @@ impl CategoryEditor {
     fn handle_delete_dictionary(
         &mut self,
         lang: &str,
+        hub: &Hub,
         rq: &mut RenderQueue,
         context: &mut Context,
     ) -> bool {
@@ -625,7 +626,7 @@ impl CategoryEditor {
 
         self.current_page = 0;
         self.update_rows_list(rq, context);
-        context.load_dictionaries();
+        hub.send(Event::ReindexDictionaries).ok();
         true
     }
 
@@ -706,7 +707,7 @@ impl View for CategoryEditor {
                 self.handle_download_dictionary(lang, hub)
             }
             Event::Select(EntryId::DeleteDictionary(lang)) => {
-                self.handle_delete_dictionary(lang, rq, context)
+                self.handle_delete_dictionary(lang, hub, rq, context)
             }
             Event::AddLibrary => self.handle_add_library_event(hub, rq, context),
             Event::EditLibrary(index) => self.handle_edit_library_event(*index, hub, rq, context),
@@ -735,7 +736,7 @@ impl View for CategoryEditor {
 
                         self.current_page = 0;
                         self.update_rows_list(rq, context);
-                        context.load_dictionaries();
+                        hub.send(Event::ReindexDictionaries).ok();
 
                         hub.send(Event::Notification(NotificationEvent::Show(fl!(
                             "notification-downloading-dictionary-completed",

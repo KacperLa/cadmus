@@ -1,12 +1,12 @@
 use crate::battery::Battery;
 use crate::db::Database;
 use crate::device::CURRENT_DEVICE;
-use crate::dictionary::{load_dictionary_from_file, Dictionary};
+use crate::dictionary::{load_dictionary_from_db, Dictionary};
 use crate::font::Fonts;
 use crate::framebuffer::{Display, Framebuffer};
 use crate::frontlight::Frontlight;
 use crate::geom::Rectangle;
-use crate::helpers::{load_json, IsHidden};
+use crate::helpers::{load_json, Fingerprint, Fp, IsHidden};
 use crate::library::Library;
 use crate::lightsensor::LightSensor;
 use crate::rtc::{AlarmManager, Rtc};
@@ -21,6 +21,7 @@ use rand_xoshiro::Xoroshiro128Plus;
 use std::collections::{BTreeMap, VecDeque};
 #[cfg(test)]
 use std::env;
+use std::io;
 use std::path::Path;
 use tracing::error;
 
@@ -162,7 +163,20 @@ impl Context {
             if !content_path.exists() {
                 content_path.set_extension("");
             }
-            if let Ok(mut dict) = load_dictionary_from_file(&content_path, &index_path) {
+
+            let dict_result = match fingerprint_dict_pair(&index_path) {
+                Ok(fp) => load_dictionary_from_db(&content_path, &self.database, fp),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %index_path.display(),
+                        error = %e,
+                        "failed to fingerprint index file, skipping dictionary"
+                    );
+                    continue;
+                }
+            };
+
+            if let Ok(mut dict) = dict_result {
                 let name = dict.short_name().ok().unwrap_or_else(|| {
                     index_path
                         .file_stem()
@@ -203,6 +217,15 @@ impl Context {
             self.frontlight.set_warmth(0.0);
         }
     }
+}
+
+/// Fingerprints a StarDict dictionary pair by hashing only the `.index` file.
+///
+/// The `.index` and `.dict` files in a StarDict pair are always installed and
+/// replaced together, so hashing the `.index` alone is sufficient to detect
+/// any change to either file.
+fn fingerprint_dict_pair(index_path: &Path) -> io::Result<Fp> {
+    index_path.fingerprint()
 }
 
 #[cfg(test)]

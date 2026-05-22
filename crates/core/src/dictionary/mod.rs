@@ -12,6 +12,7 @@ pub mod indexing;
 #[cfg(not(feature = "bench"))]
 mod indexing;
 
+pub(crate) mod db_index;
 mod monolingual;
 
 pub(crate) use monolingual::MonolingualDictionaryService;
@@ -20,6 +21,9 @@ use std::path::Path;
 
 use self::dictreader::DictReader;
 use self::indexing::IndexReader;
+pub(crate) use self::indexing::{apply_transform, normalize, Entry};
+use crate::db::Database;
+use crate::helpers::Fp;
 
 /// A dictionary wrapper.
 ///
@@ -46,22 +50,20 @@ impl Dictionary {
     ///
     /// Words are looked up in the index and then retrieved from the dict file. If no word was
     /// found, the returned vector is empty. Errors result from the parsing of the underlying files.
+    ///
+    /// Normalization (lowercasing, char filtering) is applied at index time, so the query word
+    /// must be normalized the same way before calling this method.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self), fields(word = %word, fuzzy)))]
     pub fn lookup(
         &mut self,
         word: &str,
         fuzzy: bool,
     ) -> Result<Vec<[String; 2]>, errors::DictError> {
-        let mut query = word.to_string();
-        if !self.metadata.case_sensitive {
-            query = query.to_lowercase();
-        }
-        if !self.metadata.all_chars {
-            query = query
-                .chars()
-                .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-                .collect();
-        }
+        let query = apply_transform(
+            word,
+            !self.metadata.all_chars,
+            !self.metadata.case_sensitive,
+        );
         let entries = self.index.load_and_find(&query, fuzzy, &self.metadata);
         let mut results = Vec::new();
         for entry in entries.into_iter() {
@@ -116,17 +118,53 @@ impl Dictionary {
     }
 }
 
-/// Load dictionary from given paths
+/// Resolves the `dict_id` for a given fingerprint from the database.
 ///
-/// A dictionary is made of an index and a dictionary (data) file, both are opened from the given
-/// input file names. Gzipped files with the suffix `.dz` will be handled automatically.
-#[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
-pub fn load_dictionary_from_file<P: AsRef<Path>>(
+/// Returns `None` if the fingerprint is not found in `dictionary_index_meta`.
+#[cfg_attr(feature = "tracing", tracing::instrument(skip(database), fields(fingerprint = %fingerprint)))]
+pub fn resolve_dict_id(database: &Database, fingerprint: &Fp) -> Option<i64> {
+    let fp_str = fingerprint.to_string();
+    let pool = database.pool().clone();
+
+    crate::db::runtime::RUNTIME
+        .block_on(async {
+            sqlx::query_scalar!(
+                "SELECT dict_id FROM dictionary_index_meta WHERE fingerprint = ?",
+                fp_str
+            )
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten()
+        })
+        .flatten()
+}
+
+/// Load dictionary using a database-backed index reader.
+///
+/// The content file is read from disk; index lookups are served from the
+/// database. Returns an error if the dictionary has not yet been registered
+/// in `dictionary_index_meta` — this happens when the indexing task has not
+/// run yet for this file. The caller should skip the dictionary in that case
+/// and retry after indexing completes.
+#[cfg_attr(feature = "tracing", tracing::instrument(skip(database), fields(fingerprint = %fingerprint)))]
+pub fn load_dictionary_from_db<P: AsRef<Path> + std::fmt::Debug>(
     content_path: P,
-    index_path: P,
+    database: &Database,
+    fingerprint: Fp,
 ) -> Result<Dictionary, errors::DictError> {
+    let dict_id = match resolve_dict_id(database, &fingerprint) {
+        Some(id) => id,
+        None => {
+            tracing::warn!(fingerprint = %fingerprint, "dictionary not yet indexed, skipping");
+            return Err(errors::DictError::InvalidFileFormat(
+                "dictionary not yet indexed".into(),
+                None,
+            ));
+        }
+    };
     let content = dictreader::load_dict(content_path)?;
-    let index = Box::new(indexing::parse_index_from_file(index_path, true)?);
+    let index = Box::new(db_index::DbIndexReader::new(database, Some(dict_id)));
     Ok(load_dictionary(content, index))
 }
 
@@ -134,8 +172,7 @@ pub fn load_dictionary_from_file<P: AsRef<Path>>(
 ///
 /// A dictionary is made of an index and a dictionary (data). Both are required for look up. This
 /// function allows abstraction from the underlying source by only requiring a
-/// `dictReader` as trait object. This way, dictionaries from RAM or similar can be
-/// implemented.
+/// `DictReader` and an [`IndexReader`].
 #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
 pub fn load_dictionary(content: Box<dyn DictReader>, index: Box<dyn IndexReader>) -> Dictionary {
     let all_chars = !index.find("00-database-allchars", false).is_empty();
@@ -158,11 +195,77 @@ pub fn load_dictionary(content: Box<dyn DictReader>, index: Box<dyn IndexReader>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::runtime::RUNTIME;
 
     const PATH_CASE_SENSITIVE_DICT: &str = "src/dictionary/testdata/case_sensitive_dict.dict";
-    const PATH_CASE_SENSITIVE_INDEX: &str = "src/dictionary/testdata/case_sensitive_dict.index";
     const PATH_CASE_INSENSITIVE_DICT: &str = "src/dictionary/testdata/case_insensitive_dict.dict";
-    const PATH_CASE_INSENSITIVE_INDEX: &str = "src/dictionary/testdata/case_insensitive_dict.index";
+    type TestEntry = (&'static str, i64, i64, Option<&'static str>);
+
+    const CASE_INSENSITIVE_ENTRIES: &[TestEntry] = &[
+        ("00-database-allchars", 1, 1, None),
+        ("bar", 443, 30, None),
+        ("foo", 428, 15, None),
+        ("straße", 516, 44, None),
+    ];
+
+    const CASE_SENSITIVE_ENTRIES: &[TestEntry] = &[
+        ("00-database-allchars", 1, 1, None),
+        ("00-database-case-sensitive", 2, 1, None),
+        ("Bar", 459, 30, None),
+        ("foo", 444, 15, None),
+        ("straße", 532, 44, None),
+    ];
+
+    fn load_test_dictionary(
+        content_path: &str,
+        entries: &[TestEntry],
+        case_sensitive: bool,
+        all_chars: bool,
+    ) -> Result<Dictionary, errors::DictError> {
+        let db = Database::new(":memory:").expect("in-memory db");
+        db.migrate().expect("migrations");
+
+        let fp = Fp::from_u64(1);
+        let fp_str = fp.to_string();
+
+        RUNTIME.block_on(async {
+            sqlx::query!(
+                r#"INSERT INTO dictionary_index_meta (fingerprint, dict_path, total_lines, indexed_lines, completed)
+                   VALUES (?, ?, ?, 0, 0)"#,
+                fp_str,
+                content_path,
+                0_i64,
+            )
+            .execute(db.pool())
+            .await
+            .expect("insert meta");
+
+            for (word, offset, size, original) in entries {
+                let normalized = apply_transform(word, !all_chars, !case_sensitive);
+                let stored_original = if normalized != *word {
+                    Some(*word)
+                } else {
+                    None
+                };
+                let final_original = original.or(stored_original);
+
+                sqlx::query!(
+                    r#"INSERT OR IGNORE INTO dictionary_index_entry (dict_id, word, offset, size, original)
+                       VALUES (?, ?, ?, ?, ?)"#,
+                    1_i64,
+                    normalized,
+                    offset,
+                    size,
+                    final_original,
+                )
+                .execute(db.pool())
+                .await
+                .expect("insert entry");
+            }
+        });
+
+        load_dictionary_from_db(content_path, &db, fp)
+    }
 
     fn assert_dict_word_exists(
         mut dict: Dictionary,
@@ -179,14 +282,24 @@ mod tests {
     }
 
     #[test]
-    fn test_load_dictionary_from_file() {
-        let r = load_dictionary_from_file(PATH_CASE_INSENSITIVE_DICT, PATH_CASE_INSENSITIVE_INDEX);
+    fn test_load_dictionary_from_db() {
+        let r = load_test_dictionary(
+            PATH_CASE_INSENSITIVE_DICT,
+            CASE_INSENSITIVE_ENTRIES,
+            false,
+            true,
+        );
         assert!(r.is_ok());
     }
 
     #[test]
     fn test_dictionary_lookup_case_insensitive() {
-        let r = load_dictionary_from_file(PATH_CASE_INSENSITIVE_DICT, PATH_CASE_INSENSITIVE_INDEX);
+        let r = load_test_dictionary(
+            PATH_CASE_INSENSITIVE_DICT,
+            CASE_INSENSITIVE_ENTRIES,
+            false,
+            true,
+        );
         let mut dict = r.unwrap();
 
         dict = assert_dict_word_exists(dict, "bar", "test for case-sensitivity");
@@ -196,7 +309,12 @@ mod tests {
 
     #[test]
     fn test_dictionary_lookup_case_insensitive_fuzzy() {
-        let r = load_dictionary_from_file(PATH_CASE_INSENSITIVE_DICT, PATH_CASE_INSENSITIVE_INDEX);
+        let r = load_test_dictionary(
+            PATH_CASE_INSENSITIVE_DICT,
+            CASE_INSENSITIVE_ENTRIES,
+            false,
+            true,
+        );
         let mut dict = r.unwrap();
 
         let r = dict.lookup("ba", true);
@@ -209,7 +327,7 @@ mod tests {
 
     #[test]
     fn test_dictionary_lookup_case_sensitive() {
-        let r = load_dictionary_from_file(PATH_CASE_SENSITIVE_DICT, PATH_CASE_SENSITIVE_INDEX);
+        let r = load_test_dictionary(PATH_CASE_SENSITIVE_DICT, CASE_SENSITIVE_ENTRIES, true, true);
         let mut dict = r.unwrap();
 
         dict = assert_dict_word_exists(dict, "Bar", "test for case-sensitivity");
@@ -224,7 +342,7 @@ mod tests {
 
     #[test]
     fn test_dictionary_lookup_case_sensitive_fuzzy() {
-        let r = load_dictionary_from_file(PATH_CASE_SENSITIVE_DICT, PATH_CASE_SENSITIVE_INDEX);
+        let r = load_test_dictionary(PATH_CASE_SENSITIVE_DICT, CASE_SENSITIVE_ENTRIES, true, true);
         let mut dict = r.unwrap();
 
         let r = dict.lookup("Ba", true);

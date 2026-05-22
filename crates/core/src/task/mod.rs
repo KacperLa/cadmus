@@ -36,6 +36,7 @@
 
 #[cfg(any(all(feature = "test", feature = "kobo"), doc))]
 mod dbus_monitor;
+pub mod dictionary_index;
 #[cfg(any(feature = "test", doc))]
 mod hello_world;
 pub mod import;
@@ -73,6 +74,8 @@ pub enum TaskId {
     Placeholder,
     /// Library import task.
     Import,
+    /// Dictionary index background task.
+    DictionaryIndex,
     /// The example task that prints periodically (test builds only).
     #[cfg(any(feature = "test", doc))]
     HelloWorld,
@@ -95,6 +98,7 @@ impl std::fmt::Display for TaskId {
         match self {
             TaskId::Placeholder => write!(f, "placeholder"),
             TaskId::Import => write!(f, "import"),
+            TaskId::DictionaryIndex => write!(f, "dictionary_index"),
             #[cfg(feature = "test")]
             TaskId::HelloWorld => write!(f, "hello_world"),
             #[cfg(all(feature = "test", feature = "kobo"))]
@@ -349,6 +353,9 @@ impl TaskManager {
                     self.schedule_import(pending, hub, database, settings);
                 }
             }
+            Event::ReindexDictionaries => {
+                self.schedule_dictionary_index(hub, database);
+            }
             _ => {}
         }
         false
@@ -376,6 +383,23 @@ impl TaskManager {
 
         if let Err(e) = self.start(task, hub.clone()) {
             tracing::warn!(error = %e, "failed to start import task");
+        }
+    }
+
+    /// Schedules a dictionary index scan, stopping any running instance first.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
+    fn schedule_dictionary_index(&mut self, hub: &Sender<Event>, database: &Database) {
+        if self.is_running(&TaskId::DictionaryIndex) {
+            tracing::debug!("stopping running dictionary index task for restart");
+            if let Err(e) = self.stop(&TaskId::DictionaryIndex) {
+                tracing::warn!(error = %e, "failed to stop dictionary_index task for restart");
+            }
+        }
+
+        let task = Box::new(dictionary_index::DictionaryIndexTask::new(database.clone()));
+
+        if let Err(e) = self.start(task, hub.clone()) {
+            tracing::warn!(error = %e, "failed to start dictionary_index task");
         }
     }
 
@@ -412,6 +436,7 @@ impl Drop for TaskManager {
 /// - [`hello_world::HelloWorldTask`] - prints "Hello world!" every minute (test only)
 /// - [`dbus_monitor::DbusMonitorTask`] - monitors D-Bus signals (test + kobo only, when `settings.logging.enable_dbus_log` is true)
 /// - [`import::ImportTask`] - imports all libraries if `settings.import.startup_trigger` is set
+/// - [`dictionary_index::DictionaryIndexTask`] - indexes `.index` dictionary files into SQLite
 pub fn register_startup_tasks(
     manager: &mut TaskManager,
     hub: Sender<Event>,
@@ -444,6 +469,11 @@ pub fn register_startup_tasks(
 
     if settings.import.startup_trigger {
         manager.schedule_import(None, &hub, database, settings);
+    }
+
+    let task = Box::new(dictionary_index::DictionaryIndexTask::new(database.clone()));
+    if let Err(e) = manager.start(task, hub.clone()) {
+        tracing::warn!(error = %e, "failed to start dictionary_index task");
     }
 }
 
