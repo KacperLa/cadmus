@@ -1,6 +1,25 @@
 #![allow(unused)]
 
+use std::ffi::c_void;
 use std::mem;
+
+/// Checks whether the loaded MuPDF library exports `fz_load_webp`.
+///
+/// # Safety
+///
+/// `RTLD_DEFAULT` is valid because the process loader resolves
+/// global symbols — MuPDF's linked library (or a dependency) exports
+/// `fz_load_webp`. The byte string `b"fz_load_webp\0".as_ptr()` is
+/// null-terminated and lives in static memory for the call's duration.
+/// The cast to `*const _` is sound: `dlsym` expects a C string pointer,
+/// and we only check `is_null()` without dereferencing the symbol.
+fn has_webp_support() -> bool {
+    unsafe { !libc::dlsym(libc::RTLD_DEFAULT, b"fz_load_webp\0".as_ptr() as *const _).is_null() }
+}
+
+pub fn log_mupdf_features() {
+    tracing::info!(webp = has_webp_support(), "MuPDF features");
+}
 
 pub const FZ_MAX_COLORS: usize = 32;
 pub const FZ_VERSION: &str = "1.27.0";

@@ -8,7 +8,7 @@ use anyhow::Result;
 use clap::Args;
 
 use super::setup_native;
-use super::util::{cmd, mupdf_wrapper, workspace};
+use super::util::{cmd, workspace};
 
 /// Arguments for `cargo xtask install-importer`.
 #[derive(Debug, Args)]
@@ -27,8 +27,7 @@ pub struct InstallImporterArgs {
 pub fn run(args: InstallImporterArgs) -> Result<()> {
     let root = workspace::root()?;
 
-    setup_native::ensure_mupdf_sources(&root, false)?;
-    mupdf_wrapper::build_native_if_needed(&root)?;
+    setup_native::ensure_native_artifacts(&root, false)?;
 
     let importer_path = root.join("crates/importer");
     let importer_str = importer_path.to_string_lossy().into_owned();

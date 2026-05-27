@@ -275,6 +275,19 @@
       "registryUrlTemplate": "https://gitlab.com",
       "extractVersionTemplate": "^bzip2-(?<version>.+)$",
       "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^xtask\\/src\\/tasks\\/util\\/thirdparty\\.rs$/"
+      ],
+      "matchStrings": [
+        "LIBWEBP_VERSION: &str = \\\"(?<currentValue>[^\\\"]+)\\\""
+      ],
+      "datasourceTemplate": "github-tags",
+      "depNameTemplate": "webmproject/libwebp",
+      "extractVersionTemplate": "^v(?<version>.+)$",
+      "versioningTemplate": "semver"
     }
   ]
 }

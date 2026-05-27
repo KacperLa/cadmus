@@ -1,0 +1,213 @@
+--- a/source/fitz/load-webp.c
++++ b/source/fitz/load-webp.c
+@@ -1,7 +1,26 @@
++// This file is part of MuPDF.
++//
++// MuPDF is free software: you can redistribute it and/or modify it under the
++// terms of the GNU Affero General Public License as published by the Free
++// Software Foundation, either version 3 of the License, or (at your option)
++// any later version.
++//
++// MuPDF is distributed in the hope that it will be useful, but WITHOUT ANY
++// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++// FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
++// details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with MuPDF. If not, see <https://www.gnu.org/licenses/agpl-3.0.en.html>
++//
++// Alternative licensing terms are available from the licensor.
++// For commercial licensing, see <https://www.artifex.com/> or contact
++// Artifex Software, Inc., 39 Mesa Street, Suite 108A, San Francisco,
++// CA 94129, USA, for further information.
++
+ #include "mupdf/fitz.h"
+-
+-#ifdef HAVE_WEBP
+ 
+ #include "pixmap-imp.h"
+ 
+ #include <math.h>
++#include <string.h>
+@@ -10,14 +29,12 @@
+ 
+ #include <webp/decode.h>
+ #include <webp/demux.h>
+-#include <webp/types.h>
+ 
+ struct info
+ {
+ 	int width, height;
+ 	int xres, yres;
+ 	uint8_t orientation;
+-	int pages;
+ 	fz_colorspace *cs;
+ };
+ 
+@@ -28,13 +44,13 @@
+  * doesn't do what we want.
+  *
+  * Instead we do a round-trip conversion and return true if this differs by
+- * less than 1. This relies on high adjacent float values that differ by more
+- * than 1, actually being exact integers, so the round-trip doesn't change the
+- * value.
++ * less than 0.001. This relies on high adjacent float values that differ by
++ * more than 1, actually being exact integers, so the round-trip doesn't change
++ * the value.
+  */
+ static int float_can_be_int(float x)
+ {
+-	return fabsf(x - (float)(int) x) < 1;
++	return fabsf(x - (float)(int) x) < 0.001f;
+ }
+ 
+ static uint8_t exif_orientation_to_mupdf[9] = { 0, 1, 5, 3, 7, 6, 4, 8, 2 };
+@@ -146,7 +163,7 @@
+ 	fz_always(ctx)
+ 		fz_drop_buffer(ctx, buf);
+ 	fz_catch(ctx)
+-		fz_warn(ctx, "ignoring embedded ICC profile in JPEG");
++		fz_warn(ctx, "ignoring embedded ICC profile in WebP");
+ 
+ 	return colorspace;
+ #else
+@@ -158,12 +175,17 @@
+ webp_read_image(fz_context *ctx, struct info *info, const unsigned char *p, size_t total, int only_metadata)
+ {
+ 	fz_pixmap *image = NULL;
++	WebPDemuxer* demux = NULL;
++	uint8_t *frame_data_copy = NULL;
++
++	fz_var(image);
++	fz_var(demux);
++	fz_var(frame_data_copy);
+ 
+ 	fz_try(ctx)
+ 	{
+ 		struct WebPBitstreamFeatures features;
+ 		WebPData webp_data;
+-		WebPDemuxer* demux = NULL;
+ 
+ 		if (WebPGetFeatures(p, total, &features) != VP8_STATUS_OK)
+ 			fz_throw(ctx, FZ_ERROR_GENERIC, "unable to extract webp features");
+@@ -188,25 +210,45 @@
+ 				if (WebPDemuxGetChunk(demux, "EXIF", 1, &chunk_iter))
+ 				{
+ 					extract_exif_resolution(&chunk_iter.chunk, &info->xres, &info->yres, &info->orientation);
++					WebPDemuxReleaseChunkIterator(&chunk_iter);
+ 				}
+-				WebPDemuxReleaseChunkIterator(&chunk_iter);
+ 			}
+ 			if (WebPDemuxGetI(demux, WEBP_FF_FORMAT_FLAGS) & ICCP_FLAG)
+ 			{
+ 				WebPChunkIterator chunk_iter;
+ 				if (WebPDemuxGetChunk(demux, "ICCP", 1, &chunk_iter))
+ 				{
+ 					info->cs = extract_icc_profile(ctx, &chunk_iter.chunk, info->cs);
++					WebPDemuxReleaseChunkIterator(&chunk_iter);
+ 				}
+-				WebPDemuxReleaseChunkIterator(&chunk_iter);
+ 			}
+ 
+-			WebPDemuxDelete(demux);
+ 		}
+ 
+ 		if (!only_metadata)
+ 		{
+-			uint8_t* rgba = features.has_alpha ? WebPDecodeRGBA(p, total, NULL, NULL) : WebPDecodeRGB(p, total, NULL, NULL);
++			const uint8_t* decode_data = p;
++			size_t decode_size = total;
++
++			// For animated WebP, extract the first frame
++			if (demux && (WebPDemuxGetI(demux, WEBP_FF_FORMAT_FLAGS) & ANIMATION_FLAG))
++			{
++				WebPIterator iter;
++				if (WebPDemuxGetFrame(demux, 1, &iter))
++				{
++					frame_data_copy = fz_malloc(ctx, iter.fragment.size);
++					memcpy(frame_data_copy, iter.fragment.bytes, iter.fragment.size);
++					decode_data = frame_data_copy;
++					decode_size = iter.fragment.size;
++					// Update has_alpha for this frame
++					features.has_alpha = iter.has_alpha;
++					WebPDemuxReleaseIterator(&iter);
++				}
++			}
++
++			uint8_t* rgba = features.has_alpha ?
++				WebPDecodeRGBA(decode_data, decode_size, NULL, NULL) :
++				WebPDecodeRGB(decode_data, decode_size, NULL, NULL);
+ 
+ 			if (rgba == NULL)
+ 				fz_throw(ctx, FZ_ERROR_GENERIC, "failed decoding webp image");
+@@ -218,6 +261,13 @@
+ 
+ 			WebPFree(rgba);
+ 		}
++	}
++	fz_always(ctx)
++	{
++		if (frame_data_copy != NULL)
++			fz_free(ctx, frame_data_copy);
++		if (demux != NULL)
++			WebPDemuxDelete(demux);
+ 	}
+ 	fz_catch(ctx)
+ 		fz_rethrow(ctx);
+@@ -229,16 +289,19 @@
+ fz_load_webp(fz_context *ctx, const unsigned char *p, size_t total)
+ {
+ 	fz_pixmap *image;
+-	struct info info;
++	struct info info = {0};
++
++	info.cs = NULL;
+ 
+ 	fz_try(ctx)
+ 	{
+ 		image = webp_read_image(ctx, &info, p, total, 0);
+ 	}
+-	fz_always(ctx)
+-		fz_drop_colorspace(ctx, info.cs);
+ 	fz_catch(ctx)
++	{
++		fz_drop_colorspace(ctx, info.cs);
+ 		fz_rethrow(ctx);
++	}
+ 
+ 	return image;
+ }
+@@ -246,7 +309,9 @@
+ void
+ fz_load_webp_info(fz_context *ctx, const unsigned char *p, size_t total, int *wp, int *hp, int *xresp, int *yresp, fz_colorspace **cspacep)
+ {
+-	struct info info;
++	struct info info = {0};
++
++	info.cs = NULL;
+ 
+ 	fz_try(ctx)
+ 		webp_read_image(ctx, &info, p, total, 1);
+@@ -260,21 +325,5 @@
+ 	*wp = info.width;
+ 	*hp = info.height;
+ 	*xresp = info.xres;
+-	*yresp = info.xres;
+-}
+-
+-#else /* HAVE_WEBP */
+-
+-fz_pixmap *
+-fz_load_webp(fz_context *ctx, const unsigned char *p, size_t total)
+-{
+-	fz_throw(ctx, FZ_ERROR_GENERIC, "WebP codec is not available");
++	*yresp = info.yres;
+ }
+-
+-void
+-fz_load_webp_info(fz_context *ctx, const unsigned char *p, size_t total, int *wp, int *hp, int *xresp, int *yresp, fz_colorspace **cspacep)
+-{
+-	fz_throw(ctx, FZ_ERROR_GENERIC, "WebP codec is not available");
+-}
+-
+-#endif /* HAVE_WEBP */

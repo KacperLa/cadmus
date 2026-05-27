@@ -577,6 +577,8 @@ pub fn run() -> Result<(), Error> {
         eprintln!("Continuing without logging...");
     }
 
+    cadmus_core::document::log_mupdf_features();
+
     cadmus_core::crypto::init_crypto_provider();
 
     #[cfg(feature = "profiling")]

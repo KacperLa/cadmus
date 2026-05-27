@@ -39,6 +39,11 @@ const BUILT_LIBRARY_COPIES: &[(&str, &str)] = &[
         "libopenjp2.so",
     ),
     ("thirdparty/jbig2dec/.libs/libjbig2dec.so", "libjbig2dec.so"),
+    ("thirdparty/libwebp/src/.libs/libwebp.so", "libwebp.so"),
+    (
+        "thirdparty/libwebp/src/demux/.libs/libwebpdemux.so",
+        "libwebpdemux.so",
+    ),
     (
         "thirdparty/freetype2/objs/.libs/libfreetype.so",
         "libfreetype.so",

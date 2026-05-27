@@ -312,6 +312,8 @@ fn run() -> Result<(), Error> {
     cadmus_core::logging::init_logging(&settings.logging)
         .context("Failed to initialize logging")?;
 
+    cadmus_core::document::log_mupdf_features();
+
     cadmus_core::crypto::init_crypto_provider();
 
     #[cfg(feature = "profiling")]

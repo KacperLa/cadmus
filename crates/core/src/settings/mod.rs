@@ -491,6 +491,10 @@ pub enum FileExtension {
     Html,
     Xps,
     Oxps,
+    Webp,
+    Png,
+    Jpg,
+    Jpeg,
 }
 
 impl FileExtension {
@@ -508,6 +512,10 @@ impl FileExtension {
             FileExtension::Html,
             FileExtension::Xps,
             FileExtension::Oxps,
+            FileExtension::Webp,
+            FileExtension::Png,
+            FileExtension::Jpg,
+            FileExtension::Jpeg,
         ]
     }
 
@@ -525,6 +533,10 @@ impl FileExtension {
             FileExtension::Html => "html",
             FileExtension::Xps => "xps",
             FileExtension::Oxps => "oxps",
+            FileExtension::Webp => "webp",
+            FileExtension::Png => "png",
+            FileExtension::Jpg => "jpg",
+            FileExtension::Jpeg => "jpeg",
         }
     }
 }
@@ -545,6 +557,10 @@ impl std::str::FromStr for FileExtension {
             "html" | "htm" => Ok(FileExtension::Html),
             "xps" => Ok(FileExtension::Xps),
             "oxps" => Ok(FileExtension::Oxps),
+            "webp" => Ok(FileExtension::Webp),
+            "png" => Ok(FileExtension::Png),
+            "jpg" => Ok(FileExtension::Jpg),
+            "jpeg" => Ok(FileExtension::Jpeg),
             _ => Err(()),
         }
     }
@@ -819,7 +835,7 @@ impl Default for ReaderSettings {
             line_height: DEFAULT_LINE_HEIGHT,
             continuous_fit_to_width: true,
             ignore_document_css: false,
-            dithered_kinds: ["cbz", "png", "jpg", "jpeg"]
+            dithered_kinds: ["cbz", "png", "jpg", "jpeg", "webp"]
                 .iter()
                 .map(|k| k.to_string())
                 .collect(),
@@ -848,6 +864,10 @@ impl Default for ImportSettings {
                 FileExtension::Oxps,
                 FileExtension::Mobi,
                 FileExtension::Cbz,
+                FileExtension::Webp,
+                FileExtension::Png,
+                FileExtension::Jpg,
+                FileExtension::Jpeg,
             ]
             .iter()
             .copied()

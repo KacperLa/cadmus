@@ -45,10 +45,14 @@ fn main() {
         match target_os.as_ref() {
             "linux" => {
                 println!("cargo:rustc-link-search=target/mupdf_wrapper/Linux");
+                println!("cargo:rustc-link-search=native=thirdparty/libwebp/src/.libs");
+                println!("cargo:rustc-link-search=native=thirdparty/libwebp/src/demux/.libs");
                 println!("cargo:rustc-link-lib=dylib=stdc++");
             }
             "macos" => {
                 println!("cargo:rustc-link-search=target/mupdf_wrapper/Darwin");
+                println!("cargo:rustc-link-search=native=thirdparty/libwebp/src/.libs");
+                println!("cargo:rustc-link-search=native=thirdparty/libwebp/src/demux/.libs");
                 println!("cargo:rustc-link-lib=dylib=c++");
             }
             _ => panic!("Unsupported platform: {}.", target_os),
@@ -64,6 +68,8 @@ fn main() {
     println!("cargo:rustc-link-lib=gumbo");
     println!("cargo:rustc-link-lib=openjp2");
     println!("cargo:rustc-link-lib=jbig2dec");
+    println!("cargo:rustc-link-lib=webp");
+    println!("cargo:rustc-link-lib=webpdemux");
 
     generate_locales();
     generate_bundled_assets();

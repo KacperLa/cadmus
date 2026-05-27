@@ -5,6 +5,7 @@ pub mod pdf;
 
 mod djvulibre_sys;
 mod mupdf_sys;
+pub use mupdf_sys::log_mupdf_features;
 
 use self::djvu::DjvuOpener;
 use self::epub::EpubDocument;
@@ -181,6 +182,20 @@ pub fn file_kind<P: AsRef<Path>>(path: P) -> Option<FileExtension> {
         .and_then(|s| s.parse().ok())
 }
 
+/// Sniff the file type by reading magic bytes from the start of `path`.
+///
+/// # Supported formats
+///
+/// | Magic bytes | Offset | Format |
+/// |-------------|--------|--------|
+/// | `PK\x03\x04` + `mimetypeapplication/epub+zip` | 0 / 30 | `epub` |
+/// | `%PDF` | 0 | `pdf` |
+/// | `AT&T` | 0 | `djvu` |
+/// | `RIFF` + `WEBP` | 0 / 8 | `webp` |
+///
+/// WebP files start with `"RIFF"` and have `"WEBP"` at bytes 8–11.
+/// `RIFF` alone is not enough because many non-WebP formats (WAV, AVI, …)
+/// are also RIFF containers.
 pub fn guess_kind<P: AsRef<Path>>(path: P) -> Result<&'static str, Error> {
     let file = File::open(path.as_ref())?;
     let mut magic = [0; 4];
@@ -196,6 +211,12 @@ pub fn guess_kind<P: AsRef<Path>>(path: P) -> Result<&'static str, Error> {
         return Ok("pdf");
     } else if &magic == b"AT&T" {
         return Ok("djvu");
+    } else if &magic == b"RIFF" {
+        let mut webp_magic = [0; 4];
+        file.read_exact_at(&mut webp_magic, 8)?;
+        if &webp_magic == b"WEBP" {
+            return Ok("webp");
+        }
     }
 
     Err(format_err!("Unknown file type"))
@@ -270,7 +291,11 @@ pub fn open<P: AsRef<Path>>(path: P) -> Option<Box<dyn Document>> {
         | FileExtension::Mobi
         | FileExtension::Txt
         | FileExtension::Xps
-        | FileExtension::Oxps => {
+        | FileExtension::Oxps
+        | FileExtension::Webp
+        | FileExtension::Png
+        | FileExtension::Jpg
+        | FileExtension::Jpeg => {
             let opener = PdfOpener::new();
             if opener.is_none() {
                 warn!(path = %path.as_ref().display(), "Failed to create PdfOpener");

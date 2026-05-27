@@ -37,6 +37,8 @@ pub const SONAMES: &[&str] = &[
     "libfreetype.so",
     "libharfbuzz.so",
     "libgumbo.so",
+    "libwebp.so",
+    "libwebpdemux.so",
     "libdjvulibre.so",
     "libmupdf.so",
 ];
@@ -132,9 +134,20 @@ pub const FREETYPE2_VERSION: &str = "2.14.1";
 pub const HARFBUZZ_VERSION: &str = "14.2.0";
 /// Gumbo version, derived from the archive URL.
 pub const GUMBO_VERSION: &str = "0.10.1";
+/// libwebp version, derived from the archive URL.
+pub const LIBWEBP_VERSION: &str = "1.2.3";
 
 /// MuPDF version, tracked via GitHub Releases on `ArtifexSoftware/mupdf-downloads`.
 pub const MUPDF_VERSION: &str = "1.27.0";
+
+const MUPDF_WEBP_PATCHES: &[&str] = &[
+    "webp-upstream-697749-kobo.patch", // verbatim KOReader upstream
+    "webp-image-h-kobo.patch",         // image.h declarations (our wrapper needs these)
+    "webp-load-webp-deviations-kobo.patch", // Cadmus deviations: demux cleanup, animation, epsilon, yres, ICC warning
+];
+
+/// Marker file written after all MuPDF WebP patches succeed.
+const WEBP_PATCHED_MARKER: &str = ".webp-patched";
 
 /// All libraries in dependency order for building.
 const LIBRARY_NAMES: &[&str] = &[
@@ -144,6 +157,7 @@ const LIBRARY_NAMES: &[&str] = &[
     "libjpeg",
     "openjpeg",
     "jbig2dec",
+    "libwebp",
     "freetype2",
     "harfbuzz",
     "gumbo",
@@ -201,6 +215,10 @@ pub fn library_source(name: &str) -> Result<LibrarySource> {
         "gumbo" => Ok(LibrarySource::Tarball(format!(
             "https://github.com/google/gumbo-parser/archive/v{v}.tar.gz",
             v = GUMBO_VERSION
+        ))),
+        "libwebp" => Ok(LibrarySource::Tarball(format!(
+            "https://github.com/webmproject/libwebp/archive/refs/tags/v{v}.tar.gz",
+            v = LIBWEBP_VERSION
         ))),
         "djvulibre" => Ok(LibrarySource::Tarball(format!(
             "https://github.com/barak/djvulibre/archive/refs/tags/release.{v}.tar.gz",
@@ -420,6 +438,10 @@ pub fn build_libraries(thirdparty_dir: &Path, names: &[&str]) -> Result<()> {
                 .with_context(|| format!("failed to apply kobo.patch for {name}"))?;
         }
 
+        if name == "mupdf" {
+            apply_mupdf_webp_patches_if_needed(&lib_dir)?;
+        }
+
         let envs = [
             ("AR", "arm-linux-gnueabihf-ar"),
             ("AS", "arm-linux-gnueabihf-as"),
@@ -438,6 +460,29 @@ pub fn build_libraries(thirdparty_dir: &Path, names: &[&str]) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Applies Cadmus' MuPDF WebP patch series unless it was already applied.
+///
+/// Returns `true` when patches were applied during this call.
+pub fn apply_mupdf_webp_patches_if_needed(mupdf_dir: &Path) -> Result<bool> {
+    if mupdf_webp_patches_applied(mupdf_dir) {
+        println!("MuPDF WebP patches already applied.");
+        Ok(false)
+    } else {
+        println!("Applying MuPDF WebP patches…");
+        for patch in MUPDF_WEBP_PATCHES {
+            cmd::run("patch", &["-p", "1", "-i", patch], mupdf_dir, &[])
+                .with_context(|| format!("failed to apply {patch}"))?;
+        }
+
+        write_marker(mupdf_dir, WEBP_PATCHED_MARKER, "mupdf", "WebP patch")?;
+        Ok(true)
+    }
+}
+
+fn mupdf_webp_patches_applied(mupdf_dir: &Path) -> bool {
+    mupdf_dir.join(WEBP_PATCHED_MARKER).exists()
 }
 
 /// Removes untracked files from a directory using `git ls-files`, falling back

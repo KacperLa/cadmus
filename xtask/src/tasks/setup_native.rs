@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Args;
 
 use super::util::thirdparty::MUPDF_VERSION;
@@ -40,17 +40,7 @@ pub struct SetupNativeArgs {
 pub fn run(args: SetupNativeArgs) -> Result<()> {
     let root = workspace::root()?;
 
-    ensure_mupdf_sources(&root, args.force)?;
-    build_mupdf_wrapper_native_if_needed(&root)?;
-
-    if native_mupdf_ready(&root) {
-        println!("Native MuPDF build already present.");
-    } else {
-        build_mupdf_native(&root)?;
-        write_native_build_marker(&root)?;
-    }
-
-    link_mupdf_artifacts(&root)?;
+    ensure_native_artifacts(&root, args.force)?;
 
     println!("\nNative setup complete!");
     println!("You can now run:");
@@ -60,34 +50,163 @@ pub fn run(args: SetupNativeArgs) -> Result<()> {
     Ok(())
 }
 
+pub fn ensure_native_artifacts(root: &Path, force: bool) -> Result<()> {
+    thirdparty::download_libraries(&root.join("thirdparty"), &["libwebp"])?;
+    build_libwebp_native(root)?;
+
+    let mupdf_patched = ensure_mupdf_sources_with_webp_patches(root, force)?;
+    if mupdf_patched {
+        remove_native_wrapper_artifact(root)?;
+    }
+
+    let rebuild_mupdf = mupdf_patched || !native_mupdf_ready(root);
+    if rebuild_mupdf {
+        build_mupdf_native(root)?;
+        write_native_build_marker(root)?;
+    } else {
+        println!("Native MuPDF build already present.");
+    }
+
+    build_mupdf_wrapper_native_if_needed(root)?;
+
+    link_mupdf_artifacts(root)?;
+
+    Ok(())
+}
+
+/// Builds libwebp from source for native development.
+///
+/// # Why we combine static archives manually
+///
+/// libwebp's build system creates separate `.a` files in sub-directories
+/// (`dec/`, `dsp/`, `enc/`, `utils/`) but does **not** assemble them into a
+/// single `src/.libs/libwebp.a` when building static-only.  We extract the
+/// individual object files from each sub-archive and repack them into one
+/// unified `libwebp.a` so that downstream `build.rs` scripts can simply link
+/// with `-lwebp`.
+pub fn build_libwebp_native(root: &Path) -> Result<()> {
+    let libwebp_dir = root.join("thirdparty/libwebp");
+    if libwebp_dir.join("src/.libs/libwebp.a").exists() {
+        println!("libwebp already built for native.");
+        return Ok(());
+    }
+
+    println!("Building libwebp for native development…");
+
+    if !libwebp_dir.join("configure").exists() {
+        cmd::run("sh", &["autogen.sh"], &libwebp_dir, &[("NOCONFIGURE", "1")])
+            .context("failed to run autogen.sh for libwebp")?;
+    }
+
+    cmd::run(
+        "./configure",
+        &[
+            "--disable-shared",
+            "--enable-static",
+            "--disable-libwebpmux",
+            "--enable-libwebpdecoder",
+            "--enable-libwebpdemux",
+            "--disable-webp-tools",
+            "--with-pic",
+        ],
+        &libwebp_dir,
+        &[],
+    )
+    .context("failed to configure libwebp")?;
+
+    cmd::run("make", &["-j4"], &libwebp_dir, &[]).context("failed to build libwebp")?;
+
+    combine_libwebp_static_archives(&libwebp_dir)?;
+
+    println!("✓ libwebp built successfully");
+    Ok(())
+}
+
+/// Extracts sub-archives from a static libwebp build and repacks them into
+/// a single `src/.libs/libwebp.a`.
+///
+/// See [`build_libwebp_native`] for why this is necessary.
+fn combine_libwebp_static_archives(libwebp_dir: &Path) -> Result<()> {
+    let libs_dir = libwebp_dir.join("src/.libs");
+    std::fs::create_dir_all(&libs_dir).context("failed to create src/.libs for libwebp")?;
+
+    let sublibs = [
+        "dec/.libs/libwebpdecode.a",
+        "dsp/.libs/libwebpdsp.a",
+        "enc/.libs/libwebpencode.a",
+        "utils/.libs/libwebputils.a",
+    ];
+
+    let mut objects = vec![];
+    for sublib in &sublibs {
+        let path = libwebp_dir.join("src").join(sublib);
+        let extract_dir = libs_dir.join(format!("extract_{}", sublib.replace('/', "_")));
+        std::fs::create_dir_all(&extract_dir)?;
+        cmd::run("ar", &["x", path.to_str().unwrap()], &extract_dir, &[])
+            .with_context(|| format!("failed to extract objects from {}", path.display()))?;
+        for entry in std::fs::read_dir(&extract_dir)? {
+            objects.push(entry?.path());
+        }
+    }
+
+    let libwebp_a = libs_dir.join("libwebp.a");
+    let mut ar_args: Vec<&str> = vec!["rcs", libwebp_a.to_str().unwrap()];
+    for obj in &objects {
+        ar_args.push(obj.to_str().unwrap());
+    }
+    cmd::run("ar", &ar_args, &libwebp_dir, &[]).context("failed to create combined libwebp.a")?;
+
+    Ok(())
+}
+
 /// Ensures MuPDF sources at the required version are present in
-/// `thirdparty/mupdf/`.
+/// `thirdparty/mupdf/` and that Cadmus' WebP patch series is applied.
 ///
 /// If the version header is missing or reports a different version the
 /// existing directory is removed and the sources are re-downloaded.
 pub fn ensure_mupdf_sources(root: &Path, force: bool) -> Result<()> {
-    let version_header = root.join("thirdparty/mupdf/include/mupdf/fitz/version.h");
+    ensure_mupdf_sources_with_webp_patches(root, force).map(|_| ())
+}
 
+fn ensure_mupdf_sources_with_webp_patches(root: &Path, force: bool) -> Result<bool> {
+    let mupdf_dir = root.join("thirdparty/mupdf");
+    let version_header = mupdf_dir.join("include/mupdf/fitz/version.h");
     let current_version = read_mupdf_version(&version_header);
 
-    if !force && current_version.as_deref() == Some(MUPDF_VERSION) {
+    if force || current_version.as_deref() != Some(MUPDF_VERSION) {
+        if let Some(v) = &current_version {
+            println!("MuPDF version mismatch: have '{v}', need '{MUPDF_VERSION}'");
+        }
+
+        println!("Downloading MuPDF {MUPDF_VERSION} sources…");
+
+        if mupdf_dir.exists() {
+            thirdparty::clean_untracked(&mupdf_dir)
+                .context("failed to clean untracked files from thirdparty/mupdf")?;
+        }
+
+        thirdparty::download_libraries(&root.join("thirdparty"), &["mupdf"])?;
+    } else {
         println!("MuPDF {MUPDF_VERSION} already present.");
-        return Ok(());
     }
 
-    if let Some(v) = &current_version {
-        println!("MuPDF version mismatch: have '{v}', need '{MUPDF_VERSION}'");
+    apply_mupdf_webp_patches_if_needed(&mupdf_dir)
+}
+
+fn apply_mupdf_webp_patches_if_needed(mupdf_dir: &Path) -> Result<bool> {
+    let patched = thirdparty::apply_mupdf_webp_patches_if_needed(mupdf_dir)?;
+    if patched {
+        remove_native_build_marker(mupdf_dir);
     }
 
-    println!("Downloading MuPDF {MUPDF_VERSION} sources…");
+    Ok(patched)
+}
 
-    let mupdf_dir = root.join("thirdparty/mupdf");
-    if mupdf_dir.exists() {
-        thirdparty::clean_untracked(&mupdf_dir)
-            .context("failed to clean untracked files from thirdparty/mupdf")?;
+fn remove_native_build_marker(mupdf_dir: &Path) {
+    let marker = mupdf_dir.join(NATIVE_BUILT_MARKER);
+    if marker.exists() {
+        std::fs::remove_file(&marker).ok();
     }
-
-    thirdparty::download_libraries(&root.join("thirdparty"), &["mupdf"])
 }
 
 /// Reads the MuPDF version string from the version header file.
@@ -158,6 +277,24 @@ fn build_mupdf_wrapper_native_if_needed(root: &Path) -> Result<()> {
     mupdf_wrapper::build_native_if_needed(root)
 }
 
+fn remove_native_wrapper_artifact(root: &Path) -> Result<()> {
+    let platform_dir = if cfg!(target_os = "macos") {
+        "Darwin"
+    } else {
+        "Linux"
+    };
+    let lib = root.join(format!(
+        "target/mupdf_wrapper/{platform_dir}/libmupdf_wrapper.a"
+    ));
+
+    if lib.exists() {
+        std::fs::remove_file(&lib)
+            .with_context(|| format!("failed to remove stale {}", lib.display()))?;
+    }
+
+    Ok(())
+}
+
 /// Compiles MuPDF using system libraries for the native platform.
 fn build_mupdf_native(root: &Path) -> Result<()> {
     println!("Building MuPDF for native development…");
@@ -178,7 +315,16 @@ fn build_mupdf_native(root: &Path) -> Result<()> {
     let sys_cflags = collect_system_cflags()?;
     let xcflags = format!(
         "-DFZ_ENABLE_ICC=0 -DFZ_ENABLE_SPOT_RENDERING=0 \
-         -DFZ_ENABLE_ODT_OUTPUT=0 -DFZ_ENABLE_OCR_OUTPUT=0 {sys_cflags}"
+         -DFZ_ENABLE_ODT_OUTPUT=0 -DFZ_ENABLE_OCR_OUTPUT=0 \
+         -DHAVE_WEBP=1 -I{root}/thirdparty/libwebp/src {sys_cflags}",
+        root = root.display()
+    );
+
+    // Linker flags for libwebp static libraries
+    let xlibs = format!(
+        "-L{root}/thirdparty/libwebp/src/.libs -lwebp \
+         -L{root}/thirdparty/libwebp/src/demux/.libs -lwebpdemux",
+        root = root.display()
     );
 
     cmd::run(
@@ -194,6 +340,7 @@ fn build_mupdf_native(root: &Path) -> Result<()> {
             "commercial=no",
             "USE_SYSTEM_LIBS=yes",
             &format!("XCFLAGS={xcflags}"),
+            &format!("XLIBS={xlibs}"),
             "libs",
         ],
         &mupdf_dir,
@@ -215,6 +362,7 @@ fn collect_system_cflags() -> Result<String> {
         "harfbuzz",
         "libopenjp2",
         "libjpeg",
+        "libwebp",
         "zlib",
         "jbig2dec",
         "gumbo",
@@ -250,7 +398,7 @@ fn link_mupdf_artifacts(root: &Path) -> Result<()> {
 
     let libmupdf = release_dir.join("libmupdf.a");
     if !libmupdf.exists() {
-        bail!("libmupdf.a not found after build — check MuPDF build output");
+        anyhow::bail!("libmupdf.a not found after build -- check MuPDF build output");
     }
 
     symlink_force(&libmupdf, &target_dir.join("libmupdf.a"))?;
