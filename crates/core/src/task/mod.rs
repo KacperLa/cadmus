@@ -40,10 +40,11 @@ pub mod dictionary_index;
 #[cfg(any(feature = "test", doc))]
 mod hello_world;
 pub mod import;
+pub mod thumbnail;
 #[cfg(any(feature = "kobo", doc))]
 mod wifi_status_monitor;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
@@ -74,6 +75,8 @@ pub enum TaskId {
     Placeholder,
     /// Library import task.
     Import,
+    /// Thumbnail extraction background task.
+    ThumbnailExtraction,
     /// Dictionary index background task.
     DictionaryIndex,
     /// The example task that prints periodically (test builds only).
@@ -98,6 +101,7 @@ impl std::fmt::Display for TaskId {
         match self {
             TaskId::Placeholder => write!(f, "placeholder"),
             TaskId::Import => write!(f, "import"),
+            TaskId::ThumbnailExtraction => write!(f, "thumbnail_extraction"),
             TaskId::DictionaryIndex => write!(f, "dictionary_index"),
             #[cfg(feature = "test")]
             TaskId::HelloWorld => write!(f, "hello_world"),
@@ -211,11 +215,21 @@ pub trait BackgroundTask: Send {
     ///
     /// Override this to perform cleanup. The default implementation does nothing.
     fn stop(&mut self) {}
+
+    /// Returns a "finished" event to send after the task thread exits.
+    ///
+    /// The [`TaskManager`] sends this event after
+    /// observing the task's thread as finished. The default returns `None`.
+    fn finished_event(&self) -> Option<Event> {
+        None
+    }
 }
 
 struct RunningTask {
     handle: JoinHandle<()>,
     shutdown: Sender<()>,
+    /// Event to emit when the task is observed as naturally finished.
+    finished_event: Option<Event>,
 }
 
 /// Manages the lifecycle of background tasks.
@@ -224,9 +238,12 @@ struct RunningTask {
 /// methods to stop individual tasks or all tasks at once.
 pub struct TaskManager {
     tasks: HashMap<TaskId, RunningTask>,
-    /// A pending import rerun queued while an import was already running.
-    /// `Some(library_index)` means re-run for that index after current finishes.
-    pending_import_rerun: Option<Option<usize>>,
+    /// Library indices awaiting import while one is already running.
+    pending_import_indices: VecDeque<Option<usize>>,
+    /// Library indices awaiting thumbnail extraction while a run is in progress.
+    pending_thumbnail_indices: VecDeque<Option<usize>>,
+    /// Events from naturally finished tasks, waiting to be sent.
+    buffered_events: Vec<Event>,
 }
 
 impl TaskManager {
@@ -234,7 +251,9 @@ impl TaskManager {
     pub fn new() -> Self {
         Self {
             tasks: HashMap::new(),
-            pending_import_rerun: None,
+            pending_import_indices: VecDeque::new(),
+            pending_thumbnail_indices: VecDeque::new(),
+            buffered_events: Vec::new(),
         }
     }
 
@@ -262,6 +281,8 @@ impl TaskManager {
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let shutdown_signal = ShutdownSignal::new(shutdown_rx);
 
+        let finished_event = task.finished_event();
+
         let handle = thread::spawn(move || {
             let mut task = task;
             tracing::info!("task started");
@@ -275,6 +296,7 @@ impl TaskManager {
             RunningTask {
                 handle,
                 shutdown: shutdown_tx,
+                finished_event,
             },
         );
 
@@ -328,9 +350,34 @@ impl TaskManager {
         }
     }
 
-    /// Removes entries for tasks whose threads have finished.
+    /// Removes entries for tasks whose threads have finished, buffering
+    /// their completion events only if the thread exited successfully.
     fn cleanup_finished(&mut self) {
-        self.tasks.retain(|_, task| !task.handle.is_finished());
+        let finished: Vec<TaskId> = self
+            .tasks
+            .iter()
+            .filter(|(_, task)| task.handle.is_finished())
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in finished {
+            if let Some(task) = self.tasks.remove(&id) {
+                if task.handle.join().is_ok() {
+                    if let Some(evt) = task.finished_event {
+                        self.buffered_events.push(evt);
+                    }
+                } else {
+                    tracing::error!(task_id = %id, "task thread panicked");
+                }
+            }
+        }
+    }
+
+    /// Sends any buffered completion events from naturally finished tasks.
+    fn flush_buffered_events(&mut self, hub: &Sender<Event>) {
+        for evt in self.buffered_events.drain(..) {
+            hub.send(evt).ok();
+        }
     }
 
     /// Observes an event without consuming it.
@@ -348,14 +395,19 @@ impl TaskManager {
         database: &Database,
         settings: &Settings,
     ) -> bool {
+        self.cleanup_finished();
+        self.flush_buffered_events(hub);
+
         match evt {
             Event::ImportLibrary { library_index } => {
                 self.schedule_import(*library_index, hub, database, settings);
             }
-            Event::ImportFinished { .. } => {
-                if let Some(pending) = self.pending_import_rerun.take() {
-                    self.schedule_import(pending, hub, database, settings);
-                }
+            Event::ImportFinished { library_index } => {
+                self.drain_pending_imports(hub, database, settings);
+                self.schedule_thumbnail_extraction(*library_index, hub, database, settings);
+            }
+            Event::ThumbnailExtractionFinished { .. } => {
+                self.drain_pending_thumbnails(hub, database, settings);
             }
             Event::ReindexDictionaries => {
                 self.schedule_dictionary_index(hub, database);
@@ -365,7 +417,7 @@ impl TaskManager {
         false
     }
 
-    /// Schedules an import task, coalescing if one is already running.
+    /// Schedules an import task, queuing the index if one is already running.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     fn schedule_import(
         &mut self,
@@ -375,9 +427,12 @@ impl TaskManager {
         settings: &Settings,
     ) {
         if self.is_running(&TaskId::Import) {
-            self.pending_import_rerun = Some(library_index);
+            tracing::info!(library_index = ?library_index, "import already running, queueing");
+            self.pending_import_indices.push_back(library_index);
             return;
         }
+
+        self.flush_buffered_events(hub);
 
         let task = Box::new(import::ImportTask::new(
             database.clone(),
@@ -390,6 +445,24 @@ impl TaskManager {
         }
     }
 
+    /// Starts the next pending import when the current one finishes.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
+    fn drain_pending_imports(
+        &mut self,
+        hub: &Sender<Event>,
+        database: &Database,
+        settings: &Settings,
+    ) {
+        if self.is_running(&TaskId::Import) || self.pending_import_indices.is_empty() {
+            return;
+        }
+
+        let Some(next) = self.pending_import_indices.pop_front() else {
+            return;
+        };
+        self.schedule_import(next, hub, database, settings);
+    }
+
     /// Schedules a dictionary index scan, stopping any running instance first.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     fn schedule_dictionary_index(&mut self, hub: &Sender<Event>, database: &Database) {
@@ -400,11 +473,61 @@ impl TaskManager {
             }
         }
 
+        self.flush_buffered_events(hub);
+
         let task = Box::new(dictionary_index::DictionaryIndexTask::new(database.clone()));
 
         if let Err(e) = self.start(task, hub.clone()) {
             tracing::warn!(error = %e, "failed to start dictionary_index task");
         }
+    }
+
+    /// Schedules a thumbnail extraction task, queuing the index if one is already running.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
+    pub fn schedule_thumbnail_extraction(
+        &mut self,
+        library_index: Option<usize>,
+        hub: &Sender<Event>,
+        database: &Database,
+        settings: &Settings,
+    ) {
+        if self.is_running(&TaskId::ThumbnailExtraction) {
+            tracing::info!(library_index = ?library_index, "thumbnail extraction already running, queueing");
+            self.pending_thumbnail_indices.push_back(library_index);
+            return;
+        }
+
+        self.flush_buffered_events(hub);
+
+        let task = Box::new(thumbnail::ThumbnailExtractionTask::new(
+            database.clone(),
+            settings.clone(),
+            library_index,
+        ));
+
+        if let Err(e) = self.start(task, hub.clone()) {
+            tracing::warn!(error = %e, "failed to start thumbnail extraction task");
+        }
+    }
+
+    /// Starts the next pending thumbnail extraction when the current one finishes.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
+    fn drain_pending_thumbnails(
+        &mut self,
+        hub: &Sender<Event>,
+        database: &Database,
+        settings: &Settings,
+    ) {
+        if self.is_running(&TaskId::ThumbnailExtraction)
+            || self.pending_thumbnail_indices.is_empty()
+        {
+            return;
+        }
+
+        let Some(next) = self.pending_thumbnail_indices.pop_front() else {
+            return;
+        };
+        self.schedule_thumbnail_extraction(next, hub, database, settings);
     }
 
     /// Returns `true` if a task with the given ID is running.
@@ -593,5 +716,68 @@ mod tests {
         manager.stop_all();
 
         assert!(!manager.is_running(&TaskId::TestTask));
+    }
+
+    #[test]
+    fn test_thumbnail_extraction_task_lifecycle() {
+        let mut manager = TaskManager::new();
+        let (hub, _rx) = mpsc::channel();
+        let database = Database::new(":memory:").unwrap();
+        database.migrate().unwrap();
+        let settings = Settings::default();
+
+        manager.schedule_thumbnail_extraction(None, &hub, &database, &settings);
+
+        // Task exits quickly on an unseeded database, so wait for
+        // completion rather than asserting the transient running state.
+        wait_until_not_running(&mut manager, &TaskId::ThumbnailExtraction);
+        assert!(!manager.is_running(&TaskId::ThumbnailExtraction));
+
+        let err = manager.stop(&TaskId::ThumbnailExtraction).unwrap_err();
+        assert!(matches!(
+            err,
+            TaskError::NotRunning(TaskId::ThumbnailExtraction)
+        ));
+    }
+
+    #[test]
+    fn thumbnail_extraction_queues_when_running() {
+        let mut manager = TaskManager::new();
+        let (hub, _rx) = mpsc::channel();
+
+        // Simulate a running ThumbnailExtraction task with a blocking thread.
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let blocking_handle = thread::spawn(move || {
+            let _ = shutdown_rx.recv();
+        });
+        manager.tasks.insert(
+            TaskId::ThumbnailExtraction,
+            RunningTask {
+                handle: blocking_handle,
+                shutdown: shutdown_tx,
+                finished_event: None,
+            },
+        );
+
+        let database = Database::new(":memory:").unwrap();
+        database.migrate().unwrap();
+        let settings = Settings::default();
+
+        manager.schedule_thumbnail_extraction(Some(0), &hub, &database, &settings);
+        manager.schedule_thumbnail_extraction(Some(1), &hub, &database, &settings);
+
+        assert_eq!(manager.pending_thumbnail_indices.len(), 2);
+
+        manager.stop(&TaskId::ThumbnailExtraction).unwrap();
+
+        manager.drain_pending_thumbnails(&hub, &database, &settings);
+        assert_eq!(manager.pending_thumbnail_indices.len(), 1);
+
+        wait_until_not_running(&mut manager, &TaskId::ThumbnailExtraction);
+
+        manager.drain_pending_thumbnails(&hub, &database, &settings);
+        assert!(manager.pending_thumbnail_indices.is_empty());
+
+        wait_until_not_running(&mut manager, &TaskId::ThumbnailExtraction);
     }
 }
