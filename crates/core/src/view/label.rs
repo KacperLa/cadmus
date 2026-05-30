@@ -1,8 +1,8 @@
-use super::{Align, Bus, Event, Hub, Id, RenderData, RenderQueue, View, ID_FEEDER};
+use super::{Align, Bus, Event, Hub, ID_FEEDER, Id, RenderData, RenderQueue, View};
 use crate::color::{Color, TEXT_NORMAL};
 use crate::context::Context;
 use crate::device::CURRENT_DEVICE;
-use crate::font::{font_from_style, Fonts, NORMAL_STYLE};
+use crate::font::{Fonts, NORMAL_STYLE, font_from_style};
 use crate::framebuffer::{Framebuffer, UpdateMode};
 use crate::geom::Rectangle;
 use crate::gesture::GestureEvent;
@@ -200,7 +200,7 @@ impl View for Label {
         _rq: &mut RenderQueue,
         _context: &mut Context,
     ) {
-        if let Some(Event::ToggleNear(_, ref mut event_rect)) = self.event.as_mut() {
+        if let Some(Event::ToggleNear(_, event_rect)) = self.event.as_mut() {
             *event_rect = rect;
         }
         self.rect = rect;

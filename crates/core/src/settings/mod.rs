@@ -1,7 +1,7 @@
 mod preset;
 pub mod versioned;
 
-use crate::color::{Color, BLACK};
+use crate::color::{BLACK, Color};
 use crate::device::CURRENT_DEVICE;
 use crate::fl;
 use crate::frontlight::LightLevels;
@@ -14,7 +14,7 @@ use sqlx::error::BoxDynError;
 use sqlx::sqlite::{Sqlite, SqliteArgumentValue, SqliteTypeInfo, SqliteValueRef};
 use unic_langid::LanguageIdentifier;
 
-pub use self::preset::{guess_frontlight, LightPreset};
+pub use self::preset::{LightPreset, guess_frontlight};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -228,7 +228,9 @@ impl Intermissions {
         changed |= self.sanitize_kind(IntermKind::Share);
 
         if changed {
-            eprintln!("ignoring unsupported calendar intermissions for power-off/share; using logo instead");
+            eprintln!(
+                "ignoring unsupported calendar intermissions for power-off/share; using logo instead"
+            );
         }
 
         changed
@@ -920,42 +922,46 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             selected_library: 0,
-            #[cfg(feature = "emulator")]
-            libraries: vec![LibrarySettings {
-                name: "Cadmus Source".to_string(),
-                path: PathBuf::from("."),
-                ..Default::default()
-            }],
-            #[cfg(not(feature = "emulator"))]
-            libraries: vec![
-                LibrarySettings {
-                    name: "On Board".to_string(),
-                    path: PathBuf::from(INTERNAL_CARD_ROOT),
-                    hooks: vec![Hook {
-                        path: PathBuf::from("Articles"),
-                        program: PathBuf::from("bin/article_fetcher/article_fetcher"),
-                        sort_method: Some(SortMethod::Added),
-                        first_column: Some(FirstColumn::TitleAndAuthor),
-                        second_column: Some(SecondColumn::Progress),
-                    }],
-                    ..Default::default()
-                },
-                LibrarySettings {
-                    name: "Removable".to_string(),
-                    path: PathBuf::from(EXTERNAL_CARD_ROOT),
-                    ..Default::default()
-                },
-                LibrarySettings {
-                    name: "Dropbox".to_string(),
-                    path: PathBuf::from("/mnt/onboard/.kobo/dropbox"),
-                    ..Default::default()
-                },
-                LibrarySettings {
-                    name: "KePub".to_string(),
-                    path: PathBuf::from("/mnt/onboard/.kobo/kepub"),
-                    ..Default::default()
-                },
-            ],
+            libraries: cfg_select! {
+                feature = "emulator" => {
+                    vec![LibrarySettings {
+                        name: "Cadmus Source".to_string(),
+                        path: PathBuf::from("."),
+                        ..Default::default()
+                    }]
+                }
+                _ => {
+                    vec![
+                        LibrarySettings {
+                            name: "On Board".to_string(),
+                            path: PathBuf::from(INTERNAL_CARD_ROOT),
+                            hooks: vec![Hook {
+                                path: PathBuf::from("Articles"),
+                                program: PathBuf::from("bin/article_fetcher/article_fetcher"),
+                                sort_method: Some(SortMethod::Added),
+                                first_column: Some(FirstColumn::TitleAndAuthor),
+                                second_column: Some(SecondColumn::Progress),
+                            }],
+                            ..Default::default()
+                        },
+                        LibrarySettings {
+                            name: "Removable".to_string(),
+                            path: PathBuf::from(EXTERNAL_CARD_ROOT),
+                            ..Default::default()
+                        },
+                        LibrarySettings {
+                            name: "Dropbox".to_string(),
+                            path: PathBuf::from("/mnt/onboard/.kobo/dropbox"),
+                            ..Default::default()
+                        },
+                        LibrarySettings {
+                            name: "KePub".to_string(),
+                            path: PathBuf::from("/mnt/onboard/.kobo/kepub"),
+                            ..Default::default()
+                        },
+                    ]
+                }
+            },
             external_urls_queue: Some(PathBuf::from("bin/article_fetcher/urls.txt")),
             keyboard_layout: "English".to_string(),
             frontlight: true,
@@ -1114,7 +1120,9 @@ share = "/path/to/custom.png"
         };
 
         assert!(intermissions.set_display(IntermKind::Suspend, IntermissionDisplay::Blank));
-        assert!(intermissions.set_display(IntermKind::PowerOff, IntermissionDisplay::BlankInverted));
+        assert!(
+            intermissions.set_display(IntermKind::PowerOff, IntermissionDisplay::BlankInverted)
+        );
         assert!(intermissions.set_display(IntermKind::Share, IntermissionDisplay::Blank));
 
         assert_eq!(

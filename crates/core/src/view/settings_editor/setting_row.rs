@@ -1,6 +1,6 @@
-use super::super::label::Label;
 use super::super::Align;
-use super::super::{Bus, Event, Hub, Id, RenderQueue, View, ID_FEEDER};
+use super::super::label::Label;
+use super::super::{Bus, Event, Hub, ID_FEEDER, Id, RenderQueue, View};
 use super::kinds::{SettingIdentity, SettingKind};
 use super::setting_value::SettingValue;
 use crate::context::Context;
@@ -69,7 +69,7 @@ impl View for SettingRow {
         _context: &mut Context,
     ) -> bool {
         match evt {
-            Event::UpdateLibrary(index, ref library) => {
+            Event::UpdateLibrary(index, library) => {
                 if let SettingIdentity::LibraryInfo(our_index) = self.identity {
                     if *index == our_index {
                         if let Some(name_view) = self.children.get_mut(0) {

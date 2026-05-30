@@ -42,7 +42,7 @@ pub type RenderMode = libc::c_uint;
 pub type FormatStyle = libc::c_uint;
 
 #[link(name = "djvulibre")]
-extern "C" {
+unsafe extern "C" {
     pub fn ddjvu_context_create(name: *const libc::c_char) -> *mut ExoContext;
     pub fn ddjvu_context_release(ctx: *mut ExoContext);
     pub fn ddjvu_cache_set_size(ctx: *mut ExoContext, size: libc::c_ulong);
@@ -102,7 +102,7 @@ extern "C" {
     pub fn ddjvu_anno_get_hyperlinks(annot: *mut MiniExp) -> *mut *mut MiniExp;
     pub fn ddjvu_anno_get_metadata_keys(annot: *mut MiniExp) -> *mut *mut MiniExp;
     pub fn ddjvu_anno_get_metadata(annot: *mut MiniExp, key: *const MiniExp)
-        -> *const libc::c_char;
+    -> *const libc::c_char;
     pub fn ddjvu_miniexp_release(document: *mut ExoDocument, exp: *mut MiniExp);
     pub fn miniexp_symbol(s: *const libc::c_char) -> *const MiniExp;
     pub fn miniexp_length(exp: *mut MiniExp) -> libc::c_int;

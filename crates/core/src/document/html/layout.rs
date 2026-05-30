@@ -1,5 +1,5 @@
-use crate::color::Color;
 use crate::color::BLACK;
+use crate::color::Color;
 use crate::font::{Font, FontFamily, RenderPlan};
 use crate::geom::{Edge, Point, Rectangle};
 pub use crate::metadata::TextAlign;
@@ -219,7 +219,7 @@ impl InlineMaterial {
 
     pub fn text(&self) -> Option<&str> {
         match self {
-            InlineMaterial::Text(TextMaterial { ref text, .. }) => Some(text),
+            InlineMaterial::Text(TextMaterial { text, .. }) => Some(text),
             _ => None,
         }
     }

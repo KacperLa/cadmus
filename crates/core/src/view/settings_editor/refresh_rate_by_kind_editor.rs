@@ -2,11 +2,11 @@ use super::bottom_bar::BottomBarVariant;
 use super::editor_utils::{
     build_bottom_separator, build_two_button_bottom_bar, calculate_dimensions,
 };
+use super::kinds::SettingIdentity;
 use super::kinds::reader::{
     RefreshRateByKindInfo, RefreshRateByKindInverted, RefreshRateByKindRegular,
     RefreshRateInvertedSetting, RefreshRateRegularSetting,
 };
-use super::kinds::SettingIdentity;
 use super::setting_row::SettingRow;
 use super::setting_value::SettingsEvent;
 use crate::color::WHITE;
@@ -18,15 +18,15 @@ use crate::framebuffer::{Framebuffer, UpdateMode};
 use crate::geom::Rectangle;
 use crate::settings::{FileExtension, RefreshRatePair, Settings};
 use crate::unit::scale_by_dpi;
+use crate::view::SMALL_BAR_HEIGHT;
 use crate::view::common::locate_by_id;
 use crate::view::filler::Filler;
 use crate::view::menu::{Menu, MenuKind};
 use crate::view::named_input::NamedInput;
 use crate::view::toggleable_keyboard::ToggleableKeyboard;
-use crate::view::SMALL_BAR_HEIGHT;
 use crate::view::{
-    Bus, EntryId, Event, Hub, Id, NotificationEvent, RenderData, RenderQueue, View, ViewId,
-    ID_FEEDER,
+    Bus, EntryId, Event, Hub, ID_FEEDER, Id, NotificationEvent, RenderData, RenderQueue, View,
+    ViewId,
 };
 
 /// Sub-editor for the global refresh rate settings and per-file-extension overrides.
@@ -470,14 +470,12 @@ impl View for RefreshRateByKindEditor {
             Event::UpdateRefreshRateByKind(ext, pair) => {
                 self.handle_update_by_kind_event(*ext, pair, rq, context)
             }
-            Event::SubMenu(rect, ref entries) => {
-                self.handle_submenu_event(*rect, entries, rq, context)
-            }
+            Event::SubMenu(rect, entries) => self.handle_submenu_event(*rect, entries, rq, context),
             Event::OpenNamedInput {
                 view_id,
-                ref label,
+                label,
                 max_chars,
-                ref initial_text,
+                initial_text,
             } => self.handle_open_named_input(
                 *view_id,
                 label,
@@ -754,17 +752,17 @@ impl View for RefreshRateKindPairEditor {
         match evt {
             Event::Focus(v) => self.handle_focus_event(*v, hub, rq, context),
             Event::Validate => self.handle_validate(hub, bus),
-            Event::Submit(ViewId::RefreshRateByKindRegularInput, ref text) => {
+            Event::Submit(ViewId::RefreshRateByKindRegularInput, text) => {
                 self.handle_submit_regular(text, bus)
             }
-            Event::Submit(ViewId::RefreshRateByKindInvertedInput, ref text) => {
+            Event::Submit(ViewId::RefreshRateByKindInvertedInput, text) => {
                 self.handle_submit_inverted(text, bus)
             }
             Event::OpenNamedInput {
                 view_id,
-                ref label,
+                label,
                 max_chars,
-                ref initial_text,
+                initial_text,
             } => self.handle_open_named_input(
                 *view_id,
                 label,
