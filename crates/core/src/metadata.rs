@@ -1,3 +1,4 @@
+use crate::db::types::UnixTimestamp;
 use crate::document::asciify;
 use crate::document::djvu::DjvuOpener;
 use crate::document::epub::EpubDocument;
@@ -74,6 +75,8 @@ pub struct FileInfo {
     pub absolute_path: PathBuf,
     pub kind: String,
     pub size: u64,
+    #[serde(skip)]
+    pub mtime: Option<UnixTimestamp>,
 }
 
 impl Default for FileInfo {
@@ -83,6 +86,7 @@ impl Default for FileInfo {
             absolute_path: PathBuf::default(),
             kind: String::default(),
             size: u64::default(),
+            mtime: None,
         }
     }
 }
@@ -1203,6 +1207,7 @@ mod tests {
                 absolute_path: PathBuf::new(),
                 kind: "epub".to_string(),
                 size: 0,
+                mtime: None,
             },
             ..Default::default()
         }

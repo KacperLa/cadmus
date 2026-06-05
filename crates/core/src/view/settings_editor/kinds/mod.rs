@@ -39,8 +39,6 @@ pub enum ToggleSettings {
     ButtonScheme,
     /// Logging enabled setting
     LoggingEnabled,
-    /// Import on startup enable/disable setting
-    ImportStartupTrigger,
     /// Sync metadata enable/disable setting
     ImportSyncMetadata,
     /// Kernel logging enabled setting (test + kobo builds only)
@@ -55,6 +53,7 @@ pub enum ToggleSettings {
 ///
 /// Each variant is fully self-contained: it carries everything needed to build
 /// the widget, including the tap event or sub-menu entries.
+#[derive(Debug)]
 pub enum WidgetKind {
     /// No interactive widget; the value is shown as static text only.
     None,

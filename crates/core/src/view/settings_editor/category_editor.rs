@@ -679,6 +679,47 @@ impl CategoryEditor {
         }
     }
 
+    /// Removes the active force-import confirmation dialog, if present.
+    #[inline]
+    fn remove_force_import_confirm(&mut self, rq: &mut RenderQueue) {
+        if let Some(index) = locate_by_id(self, ViewId::ForceImportConfirm) {
+            let dialog_rect = *self.children[index].rect();
+            self.children.remove(index);
+            rq.add(RenderData::expose(dialog_rect, UpdateMode::Gui));
+        }
+    }
+
+    /// Shows the force-import confirmation dialog.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self, rq, context)))]
+    fn handle_force_import_request(&mut self, rq: &mut RenderQueue, context: &mut Context) -> bool {
+        self.remove_force_import_confirm(rq);
+
+        let dialog = Dialog::builder(
+            ViewId::ForceImportConfirm,
+            fl!("settings-import-force-full-import-confirm"),
+        )
+        .add_button(
+            &fl!("settings-import-force-full-import-cancel"),
+            Event::Close(ViewId::ForceImportConfirm),
+        )
+        .add_button(
+            &fl!("settings-import-force-full-import-confirm-button"),
+            Event::ImportLibrary {
+                library_index: None,
+                force: true,
+            },
+        )
+        .build(context);
+
+        rq.add(RenderData::new(
+            dialog.id(),
+            *dialog.rect(),
+            UpdateMode::Gui,
+        ));
+        self.children.push(Box::new(dialog));
+        true
+    }
+
     /// Starts a confirmed dictionary download and closes the confirmation dialog.
     #[inline]
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self, hub, rq, context)))]
@@ -755,6 +796,7 @@ impl CategoryEditor {
             | ViewId::SettingsValueMenu
             | ViewId::LibraryEditor
             | ViewId::DictionaryDownloadConfirm
+            | ViewId::ForceImportConfirm
             | ViewId::RefreshRateByKindEditor => {
                 if let Some(index) = locate_by_id(self, *view_id) {
                     let input_rect = *self.children[index].rect();
@@ -804,6 +846,13 @@ impl View for CategoryEditor {
             Event::SubMenu(rect, entries) => self.handle_submenu_event(rect, entries, rq, context),
             Event::Select(EntryId::DeleteLibrary(index)) => {
                 self.handle_delete_library(*index, rq, context)
+            }
+            Event::Select(EntryId::RequestForceImport) => {
+                self.handle_force_import_request(rq, context)
+            }
+            Event::ImportLibrary { force: true, .. } => {
+                self.remove_force_import_confirm(rq);
+                false
             }
             Event::Select(EntryId::RequestDictionaryDownload(lang)) => {
                 self.handle_dictionary_download_request(lang, hub, rq, context)
@@ -951,6 +1000,13 @@ mod tests {
         let mut rq = RenderQueue::new();
 
         CategoryEditor::new(rect, Category::Dictionaries, &mut rq, context)
+    }
+
+    fn create_test_import_category_editor(context: &mut Context) -> CategoryEditor {
+        let rect = rect![0, 0, 600, 800];
+        let mut rq = RenderQueue::new();
+
+        CategoryEditor::new(rect, Category::Import, &mut rq, context)
     }
 
     #[test]
@@ -1432,6 +1488,105 @@ mod tests {
         assert!(
             !rq2.is_empty(),
             "RenderQueue should have render requests from update_rows_list()"
+        );
+    }
+
+    #[test]
+    fn test_force_import_opens_confirmation_dialog() {
+        let mut context = create_test_context();
+        let mut editor = create_test_import_category_editor(&mut context);
+        let (hub, _receiver) = channel();
+        let mut bus = VecDeque::new();
+        let mut rq = RenderQueue::new();
+
+        assert!(
+            locate_by_id(&editor, ViewId::ForceImportConfirm).is_none(),
+            "Force import confirmation dialog should not be present initially"
+        );
+
+        let handled = editor.handle_event(
+            &Event::Select(EntryId::RequestForceImport),
+            &hub,
+            &mut bus,
+            &mut rq,
+            &mut context,
+        );
+
+        assert!(handled, "RequestForceImport event should be handled");
+        assert!(
+            locate_by_id(&editor, ViewId::ForceImportConfirm).is_some(),
+            "Force import confirmation dialog should be present"
+        );
+        assert!(!rq.is_empty());
+    }
+
+    #[test]
+    fn test_close_force_import_confirmation_removes_dialog() {
+        let mut context = create_test_context();
+        let mut editor = create_test_import_category_editor(&mut context);
+        let (hub, _receiver) = channel();
+        let mut bus = VecDeque::new();
+        let mut rq = RenderQueue::new();
+
+        editor.handle_event(
+            &Event::Select(EntryId::RequestForceImport),
+            &hub,
+            &mut bus,
+            &mut rq,
+            &mut context,
+        );
+
+        let handled = editor.handle_event(
+            &Event::Close(ViewId::ForceImportConfirm),
+            &hub,
+            &mut bus,
+            &mut rq,
+            &mut context,
+        );
+
+        assert!(handled, "Close event should be handled");
+        assert!(
+            locate_by_id(&editor, ViewId::ForceImportConfirm).is_none(),
+            "Force import confirmation dialog should be removed"
+        );
+        assert!(!rq.is_empty());
+    }
+
+    #[test]
+    fn test_import_library_force_true_closes_confirmation_dialog() {
+        let mut context = create_test_context();
+        let mut editor = create_test_import_category_editor(&mut context);
+        let (hub, _receiver) = channel();
+        let mut bus = VecDeque::new();
+        let mut rq = RenderQueue::new();
+
+        editor.handle_event(
+            &Event::Select(EntryId::RequestForceImport),
+            &hub,
+            &mut bus,
+            &mut rq,
+            &mut context,
+        );
+
+        assert!(
+            locate_by_id(&editor, ViewId::ForceImportConfirm).is_some(),
+            "Force import confirmation dialog should be open"
+        );
+
+        editor.handle_event(
+            &Event::ImportLibrary {
+                library_index: None,
+                force: true,
+            },
+            &hub,
+            &mut bus,
+            &mut rq,
+            &mut context,
+        );
+
+        assert!(
+            locate_by_id(&editor, ViewId::ForceImportConfirm).is_none(),
+            "Force import confirmation dialog should be removed after force import"
         );
     }
 }
