@@ -282,6 +282,7 @@ in
     pkgs.libtool
     pkgs.gperf
     pkgs.python3
+    pkgs.tcl
 
     # Libraries for native builds (emulator/tests)
     pkgs.djvulibre
@@ -388,6 +389,11 @@ in
     # C compiler for ARM target (used by cc crate for build scripts)
     CC_arm_unknown_linux_gnueabihf = "arm-linux-gnueabihf-gcc";
     AR_arm_unknown_linux_gnueabihf = "arm-linux-gnueabihf-ar";
+
+    # Point libsqlite3-sys at the custom SQLite build (cargo xtask setup)
+    SQLITE3_LIB_DIR = "target/cadmus-build-deps/${pkgs.stdenv.hostPlatform.rust.rustcTargetSpec}/sqlite/lib";
+    SQLITE3_INCLUDE_DIR = "target/cadmus-build-deps/${pkgs.stdenv.hostPlatform.rust.rustcTargetSpec}/sqlite/include";
+    SQLITE3_STATIC = "1";
   };
 
   services.opentelemetry-collector = {

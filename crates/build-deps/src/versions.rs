@@ -76,6 +76,15 @@ pub const CROSS_ENV: &[(&str, &str)] = &[
     ),
     ("CC_arm_unknown_linux_gnueabihf", "arm-linux-gnueabihf-gcc"),
     ("AR_arm_unknown_linux_gnueabihf", "arm-linux-gnueabihf-ar"),
+    (
+        "SQLITE3_LIB_DIR",
+        "target/cadmus-build-deps/arm-unknown-linux-gnueabihf/sqlite/lib",
+    ),
+    (
+        "SQLITE3_INCLUDE_DIR",
+        "target/cadmus-build-deps/arm-unknown-linux-gnueabihf/sqlite/include",
+    ),
+    ("SQLITE3_STATIC", "1"),
 ];
 
 /// Mapping from built `.so` paths to their destination names in the
