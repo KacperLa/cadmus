@@ -157,6 +157,20 @@ This setting is optional. When not set, `en-GB` is used.
 locale = "en-GB"
 ```
 
+### `startup-mode`
+
+✏️
+
+What to show when Cadmus starts.
+
+- `"home"` — open the home screen (default).
+- `"last-file"` — re-open the last book you were reading. If there is no
+  unfinished book in the selected library, the home screen is shown instead.
+
+```toml
+startup-mode = "home"
+```
+
 ## Reader
 
 Settings that control the reading experience.
