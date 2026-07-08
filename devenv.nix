@@ -761,7 +761,7 @@ in
 
     # Build for Kobo device
     cadmus-build-kobo.exec = ''
-      cargo xtask build-kobo
+      cargo xtask build-kobo "$@"
       cargo xtask dist
     '';
 
