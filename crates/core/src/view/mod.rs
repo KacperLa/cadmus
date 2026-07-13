@@ -867,6 +867,7 @@ pub enum EntryId {
     Suspend,
     PowerOff,
     CheckForUpdates,
+    ToggleKeyboard,
     FileEntry(PathBuf),
     Ota(OtaEntryId),
     /// Open the per-kind refresh rate editor for the given file extension.

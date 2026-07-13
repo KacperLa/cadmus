@@ -52,4 +52,15 @@ impl Pty {
         self.writer.flush().context("PTY flush failed")?;
         Ok(n)
     }
+
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        self.master.resize(size).context("PTY resize failed")?;
+        Ok(())
+    }
 }
