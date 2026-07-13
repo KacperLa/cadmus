@@ -51,8 +51,8 @@ pub mod settings_editor;
 pub mod sketch;
 pub mod slider;
 pub mod startup;
-pub mod toggle;
 pub mod terminal;
+pub mod toggle;
 pub mod toggleable_keyboard;
 pub mod top_bar;
 pub mod touch_events;
@@ -75,7 +75,7 @@ use crate::settings::{
     self, ButtonScheme, FinishedAction, FirstColumn, RotationLock, SecondColumn,
 };
 use crate::view::ota::OtaEntryId;
-use downcast_rs::{impl_downcast, Downcast};
+use downcast_rs::{Downcast, impl_downcast};
 use fxhash::FxHashMap;
 use std::collections::VecDeque;
 use std::fmt::{self, Debug};
@@ -840,6 +840,7 @@ pub enum EntryId {
     Suspend,
     PowerOff,
     CheckForUpdates,
+    ToggleKeyboard,
     FileEntry(PathBuf),
     Ota(OtaEntryId),
     /// Open the per-kind refresh rate editor for the given file extension.

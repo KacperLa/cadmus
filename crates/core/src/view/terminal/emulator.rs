@@ -14,8 +14,12 @@ impl Emulator {
     pub fn feed(&mut self, data: &[u8]) {
         self.parser.process(data);
     }
-    
+
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
+    }
+
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        self.parser.screen_mut().set_size(rows, cols);
     }
 }

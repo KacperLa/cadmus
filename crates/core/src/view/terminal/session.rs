@@ -1,22 +1,18 @@
-use super::{
-    buffer::DoubleBuffer,
-    emulator::Emulator,
-    pty::Pty,
-    render::TerminalRenderer,
-};
+use super::{buffer::DoubleBuffer, emulator::Emulator, pty::Pty, render::TerminalRenderer};
+use crate::color::WHITE;
 use crate::context::Context;
 use crate::device::CURRENT_DEVICE;
 use crate::font::Fonts;
 use crate::framebuffer::{Framebuffer, UpdateMode};
-use crate::geom::{CornerSpec, Rectangle, halves, Point};
+use crate::geom::{CornerSpec, Point, Rectangle};
 use crate::unit::scale_by_dpi;
 use crate::view::common::locate_by_id;
-use crate::view::icon::{Icon, ICONS_PIXMAPS};
-use crate::view::keyboard::Keyboard;
+use crate::view::icon::{ICONS_PIXMAPS, Icon};
 use crate::view::menu::{Menu, MenuKind};
+use crate::view::toggleable_keyboard::ToggleableKeyboard;
 use crate::view::{
-    Bus, EntryId, EntryKind, Event, Hub, Id, KeyboardEvent, RenderData, RenderQueue, View, ViewId, ID_FEEDER,
-    BORDER_RADIUS_SMALL, SMALL_BAR_HEIGHT, BIG_BAR_HEIGHT, THICKNESS_MEDIUM,
+    BORDER_RADIUS_SMALL, Bus, EntryId, EntryKind, Event, Hub, ID_FEEDER, Id, KeyboardEvent,
+    RenderData, RenderQueue, SMALL_BAR_HEIGHT, View, ViewId,
 };
 use anyhow::Result;
 use std::io::Read;
@@ -26,23 +22,37 @@ use std::thread::JoinHandle;
 
 const ICON_NAME: &str = "enclosed_menu";
 
+#[inline]
+fn scale_font_size(font_size: f32) -> u32 {
+    (font_size * 64.0) as u32
+}
+
 pub struct Terminal {
     id: Id,
     rect: Rectangle,
     children: Vec<Box<dyn View>>,
     double_buffer: Arc<Mutex<DoubleBuffer>>,
+    emulator: Arc<Mutex<Emulator>>,
     pty: Pty,
     shutdown_flag: Arc<AtomicBool>,
     reader_thread: Option<JoinHandle<()>>,
+    keyboard_index: usize,
+    font_size_scaled: u32,
 }
 
 impl Terminal {
-    pub fn new(rect: Rectangle, font_size: f32, rq: &mut RenderQueue, context: &mut Context, hub: &Hub) -> Result<Terminal> {
+    pub fn new(
+        rect: Rectangle,
+        font_size: f32,
+        rq: &mut RenderQueue,
+        context: &mut Context,
+        hub: &Hub,
+    ) -> Result<Terminal> {
         let id = ID_FEEDER.next();
         let mut children = Vec::new();
         let dpi = CURRENT_DEVICE.dpi;
-        let font_size_scaled = (font_size * 64.0) as u32;
-        
+        let font_size_scaled = scale_font_size(font_size);
+
         // Setup menu icon in top right corner
         let small_height = scale_by_dpi(SMALL_BAR_HEIGHT, dpi) as i32;
         let border_radius = scale_by_dpi(BORDER_RADIUS_SMALL, dpi) as i32;
@@ -65,51 +75,49 @@ impl Terminal {
         )
         .corners(Some(CornerSpec::Uniform(border_radius)));
         children.push(Box::new(icon) as Box<dyn View>);
-        
-        // Add terminal keyboard
-        let big_height = scale_by_dpi(BIG_BAR_HEIGHT, dpi) as i32;
-        let thickness = scale_by_dpi(THICKNESS_MEDIUM, dpi) as i32;
-        let (_, big_thickness) = halves(thickness);
-        
-        let saved_layout = context.settings.keyboard_layout.clone();
-        context.settings.keyboard_layout = "Terminal".to_string();
-        
-        let mut kb_rect = rect![
-            rect.min.x,
-            rect.max.y - (small_height + 3 * big_height) as i32 + big_thickness,
-            rect.max.x,
-            rect.max.y
-        ];
-        let keyboard = Keyboard::new(&mut kb_rect, false, context);
+
+        // Add toggleable terminal keyboard with Terminal layout (no bottom bar)
+        let mut keyboard = ToggleableKeyboard::new(rect, false)
+            .with_layout("Terminal")
+            .with_bottom_bar(false);
+        let keyboard_height = keyboard.keyboard_height();
+        keyboard.toggle(hub, rq, context);
         children.push(Box::new(keyboard) as Box<dyn View>);
-        
-        context.settings.keyboard_layout = saved_layout;
-        
-        // Calculate terminal grid size based on available screen space
+        let keyboard_index = children.len() - 1;
+
+        // Calculate terminal grid size based on available screen space (with keyboard visible)
         let available_width = rect.width() as i32;
-        let available_height = (kb_rect.min.y - rect.min.y) as i32;
+        let available_height = rect.height() as i32 - keyboard_height;
         let pixmap_width = rect.width();
         let pixmap_height = rect.height();
 
         let (double_buffer, buffer_writer) = DoubleBuffer::new(pixmap_width, pixmap_height);
         let double_buffer = Arc::new(Mutex::new(double_buffer));
-        
+
         let (rows, cols) = TerminalRenderer::calculate_grid_for_font_size(
             available_width,
             available_height,
             font_size_scaled,
-            &mut context.fonts
+            &mut context.fonts,
         );
- 
+
+        // Calculate max grid size (full screen without keyboard) for renderer buffer
+        let (max_rows, max_cols) = TerminalRenderer::calculate_grid_for_font_size(
+            rect.width() as i32,
+            rect.height() as i32,
+            font_size_scaled,
+            &mut context.fonts,
+        );
+
         let pty = Pty::spawn(Some("/bin/sh"), rows, cols)?;
         let mut reader = pty.take_reader()?;
         let pty_fd = pty.as_raw_fd();
-        let emulator_shared = Arc::new(Mutex::new(Emulator::new(rows, cols)));
+        let emulator = Arc::new(Mutex::new(Emulator::new(rows, cols)));
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         let hub = hub.clone();
         let buffer_shared = Arc::clone(&double_buffer);
-        let emulator_shared = Arc::clone(&emulator_shared);
+        let emulator_shared = Arc::clone(&emulator);
         let shutdown_shared = Arc::clone(&shutdown_flag);
         let font_size_scaled_for_thread = font_size_scaled;
         let reader_thread = std::thread::spawn(move || {
@@ -121,30 +129,59 @@ impl Terminal {
                     return;
                 }
             };
-            
-            let mut renderer = TerminalRenderer::new_with_font_size(&mut fonts, rows, cols, font_size_scaled_for_thread);
+
+            // Initialize renderer with max grid size to handle keyboard toggle
+            let mut renderer = TerminalRenderer::new_with_font_size(
+                &mut fonts,
+                max_rows,
+                max_cols,
+                font_size_scaled_for_thread,
+            );
             let mut buf = [0u8; 4096];
             let mut writer = buffer_writer;
-            
+
             const POLL_TIMEOUT_MS: i32 = 100;
-            
+
             let mut pfd = pty_fd.map(|fd| libc::pollfd {
                 fd,
                 events: libc::POLLIN,
                 revents: 0,
             });
-            
+
             loop {
                 if shutdown_shared.load(Ordering::Acquire) {
                     break;
                 }
-                
+
+                // Check if we need to clear renderer state and re-render
+                let should_clear = if let Ok(mut double_buf) = buffer_shared.lock() {
+                    double_buf.take_clear_renderer()
+                } else {
+                    false
+                };
+
+                if should_clear {
+                    writer.back.data.fill(WHITE.gray());
+                    renderer.clear_screen_state();
+
+                    if let Ok(emu) = emulator_shared.lock() {
+                        let screen = emu.screen();
+                        let dirty_rect =
+                            renderer.render_screen(screen, &mut writer.back, &mut fonts);
+                        writer.dirty_rect = dirty_rect;
+
+                        if let Ok(mut double_buf) = buffer_shared.lock() {
+                            double_buf.swap(&mut writer);
+                        }
+                        hub.send(Event::WakeUp).ok();
+                    }
+                }
+
                 if let Some(ref mut pollfd) = pfd {
                     pollfd.revents = 0;
-                    let ret = unsafe { 
-                        libc::poll(pollfd as *mut libc::pollfd, 1, POLL_TIMEOUT_MS) 
-                    };
-                    
+                    let ret =
+                        unsafe { libc::poll(pollfd as *mut libc::pollfd, 1, POLL_TIMEOUT_MS) };
+
                     if ret < 0 {
                         let err = std::io::Error::last_os_error();
                         if err.kind() != std::io::ErrorKind::Interrupted {
@@ -153,27 +190,28 @@ impl Terminal {
                         }
                         continue;
                     }
-                    
+
                     if ret == 0 {
                         continue;
                     }
-                    
+
                     if pollfd.revents & libc::POLLHUP != 0 {
                         break;
                     }
-                    
+
                     if pollfd.revents & libc::POLLIN == 0 {
                         continue;
                     }
                 }
-                
+
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
                         if let Ok(mut emu) = emulator_shared.lock() {
                             emu.feed(&buf[..n]);
                             let screen = emu.screen();
-                            let dirty_rect = renderer.render_screen(screen, &mut writer.back, &mut fonts);
+                            let dirty_rect =
+                                renderer.render_screen(screen, &mut writer.back, &mut fonts);
                             writer.dirty_rect = dirty_rect;
 
                             if let Ok(mut double_buf) = buffer_shared.lock() {
@@ -189,21 +227,61 @@ impl Terminal {
                 }
             }
         });
-        
+
         rq.add(RenderData::new(id, rect, UpdateMode::Full));
         let terminal = Terminal {
             id,
             rect,
             children,
             double_buffer,
+            emulator,
             pty,
             shutdown_flag,
             reader_thread: Some(reader_thread),
+            keyboard_index,
+            font_size_scaled,
         };
-        
+
         Ok(terminal)
     }
-    
+
+    fn toggle_keyboard(&mut self, hub: &Hub, rq: &mut RenderQueue, context: &mut Context) {
+        if let Some(keyboard) = self.children.get_mut(self.keyboard_index) {
+            if let Some(kb) = keyboard.downcast_mut::<ToggleableKeyboard>() {
+                kb.toggle(hub, rq, context);
+
+                let keyboard_height = if kb.is_visible() {
+                    kb.keyboard_height()
+                } else {
+                    0
+                };
+
+                let available_width = self.rect.width() as i32;
+                let available_height = self.rect.height() as i32 - keyboard_height;
+
+                let (rows, cols) = TerminalRenderer::calculate_grid_for_font_size(
+                    available_width,
+                    available_height,
+                    self.font_size_scaled,
+                    &mut context.fonts,
+                );
+
+                if let Err(e) = self.pty.resize(rows, cols) {
+                    eprintln!("Failed to resize PTY: {}", e);
+                }
+
+                if let Ok(mut emu) = self.emulator.lock() {
+                    emu.resize(rows, cols);
+                }
+
+                if let Ok(mut buffer) = self.double_buffer.lock() {
+                    buffer.request_clear_renderer();
+                    buffer.request_full_refresh();
+                }
+            }
+        }
+    }
+
     fn toggle_title_menu(
         &mut self,
         rect: Rectangle,
@@ -215,19 +293,33 @@ impl Terminal {
             if let Some(true) = enable {
                 return;
             }
-            
-            rq.add(RenderData::expose(*self.child(index).rect(), UpdateMode::FastMono));
+
+            rq.add(RenderData::expose(
+                *self.child(index).rect(),
+                UpdateMode::FastMono,
+            ));
             self.children.remove(index);
         } else {
             if let Some(false) = enable {
                 return;
             }
-            
+
             let entries = vec![
+                EntryKind::Command("Toggle Keyboard".to_string(), EntryId::ToggleKeyboard),
                 EntryKind::Command("Quit".to_string(), EntryId::Quit),
             ];
-            let menu = Menu::new(rect, ViewId::TitleMenu, MenuKind::Contextual, entries, context);
-            rq.add(RenderData::no_wait(menu.id(), *menu.rect(), UpdateMode::FastMono));
+            let menu = Menu::new(
+                rect,
+                ViewId::TitleMenu,
+                MenuKind::Contextual,
+                entries,
+                context,
+            );
+            rq.add(RenderData::no_wait(
+                menu.id(),
+                *menu.rect(),
+                UpdateMode::FastMono,
+            ));
             self.children.push(Box::new(menu) as Box<dyn View>);
         }
     }
@@ -267,6 +359,10 @@ impl View for Terminal {
                 self.toggle_title_menu(rect, None, rq, context);
                 true
             }
+            Event::Select(EntryId::ToggleKeyboard) => {
+                self.toggle_keyboard(hub, rq, context);
+                true
+            }
             Event::Select(EntryId::Quit) => {
                 hub.send(Event::Back).ok();
                 true
@@ -279,10 +375,20 @@ impl View for Terminal {
                         } else {
                             for dirty_rect in buffer.drain_dirty_rects() {
                                 let update_rect = Rectangle::new(
-                                    Point::new(self.rect.min.x + dirty_rect.min.x, self.rect.min.y + dirty_rect.min.y),
-                                    Point::new(self.rect.min.x + dirty_rect.max.x, self.rect.min.y + dirty_rect.max.y),
+                                    Point::new(
+                                        self.rect.min.x + dirty_rect.min.x,
+                                        self.rect.min.y + dirty_rect.min.y,
+                                    ),
+                                    Point::new(
+                                        self.rect.min.x + dirty_rect.max.x,
+                                        self.rect.min.y + dirty_rect.max.y,
+                                    ),
                                 );
-                                rq.add(RenderData::no_wait(self.id, update_rect, UpdateMode::FastMono));
+                                rq.add(RenderData::no_wait(
+                                    self.id,
+                                    update_rect,
+                                    UpdateMode::FastMono,
+                                ));
                             }
                         }
                     }
@@ -292,7 +398,7 @@ impl View for Terminal {
             _ => false,
         }
     }
-    
+
     fn render(&self, fb: &mut dyn Framebuffer, rect: Rectangle, _fonts: &mut Fonts) {
         if let Ok(buffer) = self.double_buffer.lock() {
             let pixmap = &buffer.front;
@@ -302,36 +408,39 @@ impl View for Terminal {
                 Point::new(rect.max.x - self.rect.min.x, rect.max.y - self.rect.min.y),
             );
             if let Some(clipped) = local_rect.intersection(&pixmap_rect) {
-                let dest = Point::new(clipped.min.x + self.rect.min.x, clipped.min.y + self.rect.min.y);
+                let dest = Point::new(
+                    clipped.min.x + self.rect.min.x,
+                    clipped.min.y + self.rect.min.y,
+                );
                 fb.draw_framed_pixmap(pixmap, &clipped, dest);
             }
         }
     }
-    
+
     fn render_rect(&self, rect: &Rectangle) -> Rectangle {
         rect.intersection(&self.rect).unwrap_or(self.rect)
     }
-    
+
     fn is_background(&self) -> bool {
         true
     }
-    
+
     fn rect(&self) -> &Rectangle {
         &self.rect
     }
-    
+
     fn rect_mut(&mut self) -> &mut Rectangle {
         &mut self.rect
     }
-    
+
     fn children(&self) -> &Vec<Box<dyn View>> {
         &self.children
     }
-    
+
     fn children_mut(&mut self) -> &mut Vec<Box<dyn View>> {
         &mut self.children
     }
-    
+
     fn id(&self) -> Id {
         self.id
     }
