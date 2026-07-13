@@ -17,6 +17,7 @@ pub struct DoubleBuffer {
     pub front: Pixmap,
     dirty_rects: VecDeque<Rectangle>,
     needs_full_refresh: bool,
+    needs_clear_renderer: bool,
 }
 
 impl DoubleBuffer {
@@ -25,6 +26,7 @@ impl DoubleBuffer {
             front: Pixmap::new(width, height, 1),
             dirty_rects: VecDeque::new(),
             needs_full_refresh: false,
+            needs_clear_renderer: false,
         };
         let writer = BufferWriter {
             back: Pixmap::new(width, height, 1),
@@ -58,5 +60,18 @@ impl DoubleBuffer {
 
     pub fn is_dirty(&self) -> bool {
         self.needs_full_refresh || !self.dirty_rects.is_empty()
+    }
+
+    pub fn request_full_refresh(&mut self) {
+        self.dirty_rects.clear();
+        self.needs_full_refresh = true;
+    }
+
+    pub fn request_clear_renderer(&mut self) {
+        self.needs_clear_renderer = true;
+    }
+
+    pub fn take_clear_renderer(&mut self) -> bool {
+        std::mem::take(&mut self.needs_clear_renderer)
     }
 }
