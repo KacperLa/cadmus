@@ -29,14 +29,17 @@ it when documentation sources change.
 
 ## One-time setup
 
-### Download runtime assets (optional)
+### Runtime assets
+
+**Required for Kobo builds** — run both before `cargo xtask build-kobo`:
 
 ```bash
 cargo xtask download-assets
+cargo xtask download-fonts
 ```
 
-Pulls static assets (fonts, icons, etc.) from the latest GitHub release. Not
-strictly required for compilation, but the emulator and some tests expect them.
+`download-assets` pulls Plato runtime directories (`bin/`, `resources/`,
+`hyphenation-patterns/`). `download-fonts` assembles the `fonts/`.
 
 Native dependencies (MuPDF, libwebp, and the C wrapper) are now built
 automatically by `build.rs` when you run any Cargo command that compiles
