@@ -11,13 +11,22 @@ pub struct BufferWriter {
     pub dirty_rect: Option<Rectangle>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RendererConfiguration {
+    pub font_size: u32,
+    pub rows: u16,
+    pub cols: u16,
+    pub pixmap_width: u32,
+    pub pixmap_height: u32,
+}
+
 /// Shared state protected by mutex: only touched during swap.
 #[derive(Debug)]
 pub struct DoubleBuffer {
     pub front: Pixmap,
     dirty_rects: VecDeque<Rectangle>,
     needs_full_refresh: bool,
-    needs_clear_renderer: bool,
+    pending_renderer_configuration: Option<RendererConfiguration>,
 }
 
 impl DoubleBuffer {
@@ -26,7 +35,7 @@ impl DoubleBuffer {
             front: Pixmap::new(width, height, 1),
             dirty_rects: VecDeque::new(),
             needs_full_refresh: false,
-            needs_clear_renderer: false,
+            pending_renderer_configuration: None,
         };
         let writer = BufferWriter {
             back: Pixmap::new(width, height, 1),
@@ -47,7 +56,14 @@ impl DoubleBuffer {
                 self.dirty_rects.push_back(rect);
             }
         }
-        writer.back.data.copy_from_slice(&self.front.data);
+        if writer.back.width == self.front.width
+            && writer.back.height == self.front.height
+            && writer.back.samples == self.front.samples
+        {
+            writer.back.data.copy_from_slice(&self.front.data);
+        } else {
+            writer.back = Pixmap::new(self.front.width, self.front.height, self.front.samples);
+        }
     }
 
     pub fn drain_dirty_rects(&mut self) -> impl Iterator<Item = Rectangle> + '_ {
@@ -67,11 +83,52 @@ impl DoubleBuffer {
         self.needs_full_refresh = true;
     }
 
-    pub fn request_clear_renderer(&mut self) {
-        self.needs_clear_renderer = true;
+    pub fn request_renderer_configuration(&mut self, configuration: RendererConfiguration) {
+        self.pending_renderer_configuration = Some(configuration);
     }
 
-    pub fn take_clear_renderer(&mut self) -> bool {
-        std::mem::take(&mut self.needs_clear_renderer)
+    pub fn take_renderer_configuration(&mut self) -> Option<RendererConfiguration> {
+        self.pending_renderer_configuration.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DoubleBuffer, RendererConfiguration};
+    use crate::framebuffer::Pixmap;
+
+    #[test]
+    fn renderer_configuration_requests_are_coalesced() {
+        let (mut buffer, _) = DoubleBuffer::new(10, 10);
+        buffer.request_renderer_configuration(RendererConfiguration {
+            font_size: 640,
+            rows: 10,
+            cols: 20,
+            pixmap_width: 100,
+            pixmap_height: 100,
+        });
+        let latest = RendererConfiguration {
+            font_size: 768,
+            rows: 8,
+            cols: 16,
+            pixmap_width: 80,
+            pixmap_height: 120,
+        };
+        buffer.request_renderer_configuration(latest);
+
+        assert_eq!(buffer.take_renderer_configuration(), Some(latest));
+        assert_eq!(buffer.take_renderer_configuration(), None);
+    }
+
+    #[test]
+    fn swap_recreates_back_pixmap_after_resize() {
+        let (mut buffer, mut writer) = DoubleBuffer::new(10, 20);
+        writer.back = Pixmap::new(30, 40, 1);
+
+        buffer.swap(&mut writer);
+
+        assert_eq!((buffer.front.width, buffer.front.height), (30, 40));
+        assert_eq!((writer.back.width, writer.back.height), (30, 40));
+        assert!(writer.back.data.iter().all(|pixel| *pixel == 255));
     }
 }
