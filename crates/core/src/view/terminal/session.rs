@@ -1,5 +1,5 @@
 use super::{
-    buffer::{DoubleBuffer, RendererConfiguration},
+    buffer::{BufferWriter, DoubleBuffer, RendererConfiguration},
     emulator::Emulator,
     pty::Pty,
     render::{TerminalGeometry, TerminalRenderer},
@@ -29,7 +29,9 @@ use crate::view::{
     RenderQueue, SMALL_BAR_HEIGHT, SliderId, THICKNESS_MEDIUM, View, ViewId,
 };
 use anyhow::Result;
+use std::fmt::{self, Display, Formatter};
 use std::io::Read;
+use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,6 +42,20 @@ const MAX_FONT_SIZE: f32 = 24.0;
 const TERMINAL_BAR_CHILD_COUNT: usize = 5;
 const PAGE_UP: &[u8] = b"\x1b[5~";
 const PAGE_DOWN: &[u8] = b"\x1b[6~";
+const POLL_TIMEOUT_MS: i32 = 100;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalKeyboardLayout {
+    Terminal,
+}
+
+impl Display for TerminalKeyboardLayout {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Terminal => formatter.write_str("Terminal"),
+        }
+    }
+}
 
 #[inline]
 fn scale_font_size(font_size: f32) -> u32 {
@@ -238,6 +254,165 @@ fn mouse_tap_sequence(
     Some(output)
 }
 
+struct ReaderSharedState {
+    hub: Hub,
+    buffer: Arc<Mutex<DoubleBuffer>>,
+    emulator: Arc<Mutex<Emulator>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+struct ReaderResources {
+    reader: Box<dyn Read + Send>,
+    pty_fd: Option<RawFd>,
+    writer: BufferWriter,
+    initial_configuration: RendererConfiguration,
+    install_dir: PathBuf,
+    dpi: u16,
+    shared: ReaderSharedState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReaderPoll {
+    Ready,
+    Retry,
+    Closed,
+}
+
+fn poll_reader(pollfd: &mut Option<libc::pollfd>) -> ReaderPoll {
+    let Some(pollfd) = pollfd else {
+        return ReaderPoll::Ready;
+    };
+    pollfd.revents = 0;
+
+    // SAFETY: `pollfd` points to one initialized `libc::pollfd` for the duration
+    // of this call, and the count passed to libc matches that single element.
+    let result = unsafe { libc::poll(pollfd as *mut libc::pollfd, 1, POLL_TIMEOUT_MS) };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return ReaderPoll::Retry;
+        }
+        tracing::error!(error = %error, "Terminal PTY poll failed");
+        return ReaderPoll::Closed;
+    }
+    if pollfd.revents & libc::POLLHUP != 0 {
+        return ReaderPoll::Closed;
+    }
+    if result == 0 || pollfd.revents & libc::POLLIN == 0 {
+        return ReaderPoll::Retry;
+    }
+    ReaderPoll::Ready
+}
+
+fn apply_pending_renderer_configuration(
+    renderer: &mut TerminalRenderer,
+    writer: &mut BufferWriter,
+    fonts: &mut Fonts,
+    dpi: u16,
+    shared: &ReaderSharedState,
+) {
+    let configuration = shared
+        .buffer
+        .lock()
+        .ok()
+        .and_then(|mut buffer| buffer.take_renderer_configuration());
+    let Some(configuration) = configuration else {
+        return;
+    };
+
+    *renderer = TerminalRenderer::new_with_font_size(
+        fonts,
+        configuration.rows,
+        configuration.cols,
+        configuration.font_size,
+        dpi,
+    );
+    writer.back = Pixmap::new(configuration.pixmap_width, configuration.pixmap_height, 1);
+    if let Ok(emulator) = shared.emulator.lock() {
+        renderer.render_screen(emulator.screen(), &mut writer.back, fonts);
+    }
+    if let Ok(mut buffer) = shared.buffer.lock() {
+        buffer.swap(writer);
+        buffer.request_full_refresh();
+    }
+    shared.hub.send(Event::WakeUp).ok();
+}
+
+fn render_terminal_output(
+    bytes: &[u8],
+    renderer: &mut TerminalRenderer,
+    writer: &mut BufferWriter,
+    fonts: &mut Fonts,
+    shared: &ReaderSharedState,
+) {
+    let Ok(mut emulator) = shared.emulator.lock() else {
+        return;
+    };
+    emulator.feed(bytes);
+    writer.dirty_rect = renderer.render_screen(emulator.screen(), &mut writer.back, fonts);
+    if let Ok(mut buffer) = shared.buffer.lock() {
+        buffer.swap(writer);
+    }
+    shared.hub.send(Event::WakeUp).ok();
+}
+
+fn run_terminal_reader(mut resources: ReaderResources) {
+    let mut fonts = match Fonts::load(&resources.install_dir) {
+        Ok(fonts) => fonts,
+        Err(error) => {
+            tracing::error!(error = %error, "Failed to load terminal fonts");
+            return;
+        }
+    };
+    let mut renderer = TerminalRenderer::new_with_font_size(
+        &mut fonts,
+        resources.initial_configuration.rows,
+        resources.initial_configuration.cols,
+        resources.initial_configuration.font_size,
+        resources.dpi,
+    );
+    let mut buffer = [0_u8; 4096];
+    let mut pollfd = resources.pty_fd.map(|fd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    });
+
+    while !resources.shared.shutdown.load(Ordering::Acquire) {
+        apply_pending_renderer_configuration(
+            &mut renderer,
+            &mut resources.writer,
+            &mut fonts,
+            resources.dpi,
+            &resources.shared,
+        );
+        match poll_reader(&mut pollfd) {
+            ReaderPoll::Retry => continue,
+            ReaderPoll::Closed => break,
+            ReaderPoll::Ready => {}
+        }
+        match resources.reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => render_terminal_output(
+                &buffer[..count],
+                &mut renderer,
+                &mut resources.writer,
+                &mut fonts,
+                &resources.shared,
+            ),
+            Err(error) => {
+                tracing::error!(error = %error, "Failed to read terminal PTY");
+                break;
+            }
+        }
+    }
+}
+
+/// A terminal session that owns a shell PTY, its emulator state, and its views.
+///
+/// Input events are forwarded to the child shell while terminal output is
+/// rendered asynchronously. Resizing synchronizes the PTY, VT100 screen, and
+/// renderer before the new layout is displayed.
 pub struct Terminal {
     id: Id,
     rect: Rectangle,
@@ -254,6 +429,10 @@ pub struct Terminal {
 }
 
 impl Terminal {
+    /// Starts a terminal session within `rect` using the configured font size.
+    ///
+    /// The terminal starts with its on-screen keyboard visible. Failure to open
+    /// the PTY, spawn the shell, or create its reader is returned to the caller.
     pub fn new(
         rect: Rectangle,
         font_size: f32,
@@ -264,13 +443,13 @@ impl Terminal {
         let id = ID_FEEDER.next();
         let mut children = terminal_bar_children(rect, font_size, context);
         let dpi = context.device.dpi();
-        let install_dir = context.device.install_dir();
+        let install_dir: PathBuf = context.device.install_dir().clone();
         let font_size_scaled = scale_font_size(font_size);
 
         let terminal_rect = rect;
 
         let mut keyboard = ToggleableKeyboard::new(terminal_rect, false)
-            .with_layout("Terminal")
+            .with_layout(TerminalKeyboardLayout::Terminal.to_string())
             .with_bottom_bar(false);
         let keyboard_height = keyboard.keyboard_height(context);
         keyboard.toggle(hub, rq, context);
@@ -296,15 +475,11 @@ impl Terminal {
         let pixel_width = available_width.clamp(0, u16::MAX as i32) as u16;
         let pixel_height = available_height.clamp(0, u16::MAX as i32) as u16;
         let pty = Pty::spawn(Some("/bin/sh"), rows, cols, pixel_width, pixel_height)?;
-        let mut reader = pty.take_reader()?;
+        let reader = pty.take_reader()?;
         let pty_fd = pty.as_raw_fd();
         let emulator = Arc::new(Mutex::new(Emulator::new(rows, cols)));
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
-        let hub = hub.clone();
-        let buffer_shared = Arc::clone(&double_buffer);
-        let emulator_shared = Arc::clone(&emulator);
-        let shutdown_shared = Arc::clone(&shutdown_flag);
         let initial_configuration = RendererConfiguration {
             font_size: font_size_scaled,
             rows,
@@ -319,115 +494,21 @@ impl Terminal {
             char_width: geometry.char_width,
             char_height: geometry.char_height,
         };
-        let install_dir_for_thread: PathBuf = install_dir.clone();
-        let reader_thread = std::thread::spawn(move || {
-            // Load fonts in the reader thread
-            let mut fonts = match Fonts::load(&install_dir_for_thread) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("Failed to load fonts in terminal thread: {}", e);
-                    return;
-                }
-            };
-
-            let mut renderer = TerminalRenderer::new_with_font_size(
-                &mut fonts,
-                initial_configuration.rows,
-                initial_configuration.cols,
-                initial_configuration.font_size,
-                dpi,
-            );
-
-            let mut buf = [0u8; 4096];
-            let mut writer = buffer_writer;
-
-            const POLL_TIMEOUT_MS: i32 = 100;
-
-            let mut pfd = pty_fd.map(|fd| libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            });
-
-            loop {
-                if shutdown_shared.load(Ordering::Acquire) {
-                    break;
-                }
-
-                let pending_configuration = buffer_shared
-                    .lock()
-                    .ok()
-                    .and_then(|mut buffer| buffer.take_renderer_configuration());
-                if let Some(configuration) = pending_configuration {
-                    renderer = TerminalRenderer::new_with_font_size(
-                        &mut fonts,
-                        configuration.rows,
-                        configuration.cols,
-                        configuration.font_size,
-                        dpi,
-                    );
-                    writer.back =
-                        Pixmap::new(configuration.pixmap_width, configuration.pixmap_height, 1);
-                    if let Ok(emu) = emulator_shared.lock() {
-                        renderer.render_screen(emu.screen(), &mut writer.back, &mut fonts);
-                    }
-                    if let Ok(mut double_buf) = buffer_shared.lock() {
-                        double_buf.swap(&mut writer);
-                        double_buf.request_full_refresh();
-                    }
-                    hub.send(Event::WakeUp).ok();
-                }
-
-                if let Some(ref mut pollfd) = pfd {
-                    pollfd.revents = 0;
-                    let ret =
-                        unsafe { libc::poll(pollfd as *mut libc::pollfd, 1, POLL_TIMEOUT_MS) };
-
-                    if ret < 0 {
-                        let err = std::io::Error::last_os_error();
-                        if err.kind() != std::io::ErrorKind::Interrupted {
-                            eprintln!("Terminal poll error: {}", err);
-                            break;
-                        }
-                        continue;
-                    }
-
-                    if ret == 0 {
-                        continue;
-                    }
-
-                    if pollfd.revents & libc::POLLHUP != 0 {
-                        break;
-                    }
-
-                    if pollfd.revents & libc::POLLIN == 0 {
-                        continue;
-                    }
-                }
-
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if let Ok(mut emu) = emulator_shared.lock() {
-                            emu.feed(&buf[..n]);
-                            let screen = emu.screen();
-                            let dirty_rect =
-                                renderer.render_screen(screen, &mut writer.back, &mut fonts);
-                            writer.dirty_rect = dirty_rect;
-
-                            if let Ok(mut double_buf) = buffer_shared.lock() {
-                                double_buf.swap(&mut writer);
-                            }
-                            hub.send(Event::WakeUp).ok();
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Terminal reader error: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
+        let reader_resources = ReaderResources {
+            reader,
+            pty_fd,
+            writer: buffer_writer,
+            initial_configuration,
+            install_dir,
+            dpi,
+            shared: ReaderSharedState {
+                hub: hub.clone(),
+                buffer: Arc::clone(&double_buffer),
+                emulator: Arc::clone(&emulator),
+                shutdown: Arc::clone(&shutdown_flag),
+            },
+        };
+        let reader_thread = std::thread::spawn(move || run_terminal_reader(reader_resources));
 
         rq.add(RenderData::expose(rect, UpdateMode::Full));
         let terminal = Terminal {
@@ -650,7 +731,7 @@ impl Terminal {
         };
 
         let mut keyboard = ToggleableKeyboard::new(rect, false)
-            .with_layout("Terminal")
+            .with_layout(TerminalKeyboardLayout::Terminal.to_string())
             .with_bottom_bar(false);
         if keyboard_visible {
             keyboard.set_visible(true, hub, rq, context);
@@ -699,6 +780,8 @@ impl Terminal {
         ));
     }
 
+    /// Handles the title event locally because this menu controls the active
+    /// terminal instance; bubbling it would open a parent view's title menu.
     fn toggle_title_menu(
         &mut self,
         rect: Rectangle,

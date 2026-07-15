@@ -67,7 +67,7 @@ rustls = { workspace = true }
 sntpc = { version = "0.10", features = ["std", "sync"] }
 sntpc-net-std = "1.2"
 webpki-roots = "1.0.5"
-portable-pty = "0.8.1"
+portable-pty = "0.9.0"
 vt100 = "0.16.2"
 
 ctor = "1.0"

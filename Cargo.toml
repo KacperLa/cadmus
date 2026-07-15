@@ -33,4 +33,4 @@ lto = true
 strip = true
 
 [patch.crates-io]
-vt100 = { git = "https://github.com/KacperLa/vt100-rust.git", branch = "add_HPA_REP" }
+vt100 = { git = "https://github.com/KacperLa/vt100-rust.git", rev = "6a45351ac049a6c87f893aa6896451c5b3720ee7" }

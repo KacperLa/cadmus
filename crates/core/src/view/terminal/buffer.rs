@@ -6,9 +6,9 @@ const MAX_DIRTY_RECTS: usize = 16;
 
 /// Writer-side handle: owns the back pixmap, can render without locking.
 #[derive(Debug)]
-pub struct BufferWriter {
-    pub back: Pixmap,
-    pub dirty_rect: Option<Rectangle>,
+pub(super) struct BufferWriter {
+    pub(super) back: Pixmap,
+    pub(super) dirty_rect: Option<Rectangle>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,15 +22,15 @@ pub(super) struct RendererConfiguration {
 
 /// Shared state protected by mutex: only touched during swap.
 #[derive(Debug)]
-pub struct DoubleBuffer {
-    pub front: Pixmap,
+pub(super) struct DoubleBuffer {
+    pub(super) front: Pixmap,
     dirty_rects: VecDeque<Rectangle>,
     needs_full_refresh: bool,
     pending_renderer_configuration: Option<RendererConfiguration>,
 }
 
 impl DoubleBuffer {
-    pub fn new(width: u32, height: u32) -> (Self, BufferWriter) {
+    pub(super) fn new(width: u32, height: u32) -> (Self, BufferWriter) {
         let shared = Self {
             front: Pixmap::new(width, height, 1),
             dirty_rects: VecDeque::new(),
@@ -46,7 +46,7 @@ impl DoubleBuffer {
 
     /// Swap front and back pixmaps. Called by writer thread after rendering.
     /// After swap, copy front to back so subsequent incremental renders work correctly.
-    pub fn swap(&mut self, writer: &mut BufferWriter) {
+    pub(super) fn swap(&mut self, writer: &mut BufferWriter) {
         std::mem::swap(&mut self.front, &mut writer.back);
         if let Some(rect) = writer.dirty_rect.take() {
             if self.dirty_rects.len() >= MAX_DIRTY_RECTS {
@@ -66,28 +66,28 @@ impl DoubleBuffer {
         }
     }
 
-    pub fn drain_dirty_rects(&mut self) -> impl Iterator<Item = Rectangle> + '_ {
+    pub(super) fn drain_dirty_rects(&mut self) -> impl Iterator<Item = Rectangle> + '_ {
         self.dirty_rects.drain(..)
     }
 
-    pub fn take_full_refresh(&mut self) -> bool {
+    pub(super) fn take_full_refresh(&mut self) -> bool {
         std::mem::take(&mut self.needs_full_refresh)
     }
 
-    pub fn is_dirty(&self) -> bool {
+    pub(super) fn is_dirty(&self) -> bool {
         self.needs_full_refresh || !self.dirty_rects.is_empty()
     }
 
-    pub fn request_full_refresh(&mut self) {
+    pub(super) fn request_full_refresh(&mut self) {
         self.dirty_rects.clear();
         self.needs_full_refresh = true;
     }
 
-    pub fn request_renderer_configuration(&mut self, configuration: RendererConfiguration) {
+    pub(super) fn request_renderer_configuration(&mut self, configuration: RendererConfiguration) {
         self.pending_renderer_configuration = Some(configuration);
     }
 
-    pub fn take_renderer_configuration(&mut self) -> Option<RendererConfiguration> {
+    pub(super) fn take_renderer_configuration(&mut self) -> Option<RendererConfiguration> {
         self.pending_renderer_configuration.take()
     }
 }
