@@ -28,7 +28,7 @@ use crate::view::{
     Align, Bus, EntryId, EntryKind, Event, Hub, ID_FEEDER, Id, KeyboardEvent, RenderData,
     RenderQueue, SMALL_BAR_HEIGHT, SliderId, THICKNESS_MEDIUM, View, ViewId,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::fmt::{self, Display, Formatter};
 use std::io::Read;
 use std::os::unix::io::RawFd;
@@ -291,6 +291,16 @@ enum ReaderPoll {
     Closed,
 }
 
+fn classify_poll_events(events: i16) -> ReaderPoll {
+    if events & libc::POLLIN != 0 {
+        ReaderPoll::Ready
+    } else if events & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        ReaderPoll::Closed
+    } else {
+        ReaderPoll::Retry
+    }
+}
+
 fn poll_reader(pollfd: &mut Option<libc::pollfd>) -> ReaderPoll {
     let Some(pollfd) = pollfd else {
         return ReaderPoll::Ready;
@@ -308,13 +318,10 @@ fn poll_reader(pollfd: &mut Option<libc::pollfd>) -> ReaderPoll {
         tracing::error!(error = %error, "Terminal PTY poll failed");
         return ReaderPoll::Closed;
     }
-    if pollfd.revents & libc::POLLHUP != 0 {
-        return ReaderPoll::Closed;
-    }
-    if result == 0 || pollfd.revents & libc::POLLIN == 0 {
+    if result == 0 {
         return ReaderPoll::Retry;
     }
-    ReaderPoll::Ready
+    classify_poll_events(pollfd.revents)
 }
 
 fn apply_pending_renderer_configuration(
@@ -453,8 +460,6 @@ impl Terminal {
         context: &mut AppContext,
         hub: &Hub,
     ) -> Result<Terminal> {
-        let id = ID_FEEDER.next();
-        let mut children = terminal_bar_children(rect, font_size, context);
         let dpi = context.device.dpi();
         let install_dir: PathBuf = context.device.install_dir().clone();
         let font_size_scaled = scale_font_size(font_size);
@@ -465,8 +470,6 @@ impl Terminal {
             .with_layout(TerminalKeyboardLayout::Terminal.to_string())
             .with_bottom_bar(false);
         let keyboard_height = keyboard.keyboard_height(context);
-        keyboard.toggle(hub, rq, context);
-        children.push(Box::new(keyboard) as Box<dyn View>);
 
         let available_width = terminal_rect.width() as i32;
         let available_height = terminal_rect.height() as i32 - keyboard_height;
@@ -521,11 +524,17 @@ impl Terminal {
                 shutdown: Arc::clone(&shutdown_flag),
             },
         };
-        let reader_thread = std::thread::spawn(move || run_terminal_reader(reader_resources));
+        let reader_thread = std::thread::Builder::new()
+            .name("terminal-reader".to_string())
+            .spawn(move || run_terminal_reader(reader_resources))
+            .context("Failed to spawn terminal reader thread")?;
 
+        let mut children = terminal_bar_children(rect, font_size, context);
+        keyboard.toggle(hub, rq, context);
+        children.push(Box::new(keyboard) as Box<dyn View>);
         rq.add(RenderData::expose(rect, UpdateMode::Full));
         let terminal = Terminal {
-            id,
+            id: ID_FEEDER.next(),
             rect,
             terminal_rect,
             children,
@@ -1078,14 +1087,30 @@ impl Drop for Terminal {
 #[cfg(test)]
 mod tests {
     use super::{
-        PAGE_DOWN, PAGE_UP, TerminalLayout, application_scroll_sequence, cursor_key_sequence,
-        mouse_tap_sequence, normalized_font_size, requests_terminal_hard_refresh,
-        scrollback_target, should_dismiss_terminal_bar, terminal_bar_rects,
-        terminal_pixel_dimensions, toggles_terminal_bar,
+        PAGE_DOWN, PAGE_UP, ReaderPoll, TerminalLayout, application_scroll_sequence,
+        classify_poll_events, cursor_key_sequence, mouse_tap_sequence, normalized_font_size,
+        requests_terminal_hard_refresh, scrollback_target, should_dismiss_terminal_bar,
+        terminal_bar_rects, terminal_pixel_dimensions, toggles_terminal_bar,
     };
     use crate::geom::{Dir, Point, Rectangle};
     use crate::gesture::GestureEvent;
     use crate::view::terminal::buffer::RendererConfiguration;
+
+    #[test]
+    fn readable_pty_data_takes_precedence_over_hangup() {
+        assert_eq!(
+            classify_poll_events(libc::POLLIN | libc::POLLHUP),
+            ReaderPoll::Ready
+        );
+        assert_eq!(classify_poll_events(libc::POLLHUP), ReaderPoll::Closed);
+    }
+
+    #[test]
+    fn terminal_poll_errors_close_the_reader() {
+        assert_eq!(classify_poll_events(libc::POLLERR), ReaderPoll::Closed);
+        assert_eq!(classify_poll_events(libc::POLLNVAL), ReaderPoll::Closed);
+        assert_eq!(classify_poll_events(0), ReaderPoll::Retry);
+    }
 
     #[test]
     fn terminal_bar_is_an_overlay_at_the_top_of_the_terminal() {
