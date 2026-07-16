@@ -1,7 +1,7 @@
 use super::{
     buffer::{BufferWriter, DoubleBuffer, RendererConfiguration},
     emulator::Emulator,
-    pty::Pty,
+    pty::{Pty, TerminalPty, TerminalSize},
     render::{TerminalGeometry, TerminalRenderer},
 };
 use crate::color::BLACK;
@@ -441,7 +441,7 @@ pub struct Terminal {
     children: Vec<Box<dyn View>>,
     double_buffer: Arc<Mutex<DoubleBuffer>>,
     emulator: Arc<Mutex<Emulator>>,
-    pty: Pty,
+    pty: Box<dyn TerminalPty>,
     shutdown_flag: Arc<AtomicBool>,
     reader_thread: Option<JoinHandle<()>>,
     top_bar_visible: bool,
@@ -461,6 +461,38 @@ impl Terminal {
         context: &mut AppContext,
         hub: &Hub,
     ) -> Result<Terminal> {
+        Self::new_with_dependencies(
+            rect,
+            font_size,
+            rq,
+            context,
+            hub,
+            |size| {
+                Pty::spawn(Some("/bin/sh"), size).map(|pty| Box::new(pty) as Box<dyn TerminalPty>)
+            },
+            |resources| {
+                std::thread::Builder::new()
+                    .name("terminal-reader".to_string())
+                    .spawn(move || run_terminal_reader(resources))
+                    .map(Some)
+                    .context("Failed to spawn terminal reader thread")
+            },
+        )
+    }
+
+    fn new_with_dependencies<P, S>(
+        rect: Rectangle,
+        font_size: f32,
+        rq: &mut RenderQueue,
+        context: &mut AppContext,
+        hub: &Hub,
+        pty_factory: P,
+        reader_spawner: S,
+    ) -> Result<Terminal>
+    where
+        P: FnOnce(TerminalSize) -> Result<Box<dyn TerminalPty>>,
+        S: FnOnce(ReaderResources) -> Result<Option<JoinHandle<()>>>,
+    {
         let dpi = context.device.dpi();
         let install_dir: PathBuf = context.device.install_dir().clone();
         let font_size_scaled = scale_font_size(font_size);
@@ -491,7 +523,12 @@ impl Terminal {
 
         let pixel_width = available_width.clamp(0, u16::MAX as i32) as u16;
         let pixel_height = available_height.clamp(0, u16::MAX as i32) as u16;
-        let pty = Pty::spawn(Some("/bin/sh"), rows, cols, pixel_width, pixel_height)?;
+        let pty = pty_factory(TerminalSize {
+            rows,
+            cols,
+            pixel_width,
+            pixel_height,
+        })?;
         let reader = pty.take_reader()?;
         let pty_fd = pty.as_raw_fd();
         let emulator = Arc::new(Mutex::new(Emulator::new(rows, cols)));
@@ -525,10 +562,7 @@ impl Terminal {
                 shutdown: Arc::clone(&shutdown_flag),
             },
         };
-        let reader_thread = std::thread::Builder::new()
-            .name("terminal-reader".to_string())
-            .spawn(move || run_terminal_reader(reader_resources))
-            .context("Failed to spawn terminal reader thread")?;
+        let reader_thread = reader_spawner(reader_resources)?;
 
         let mut children = terminal_bar_children(rect, font_size, context);
         keyboard.toggle(hub, rq, context);
@@ -543,7 +577,7 @@ impl Terminal {
             emulator,
             pty,
             shutdown_flag,
-            reader_thread: Some(reader_thread),
+            reader_thread,
             top_bar_visible: true,
             font_size,
             layout: initial_layout,
@@ -609,12 +643,12 @@ impl Terminal {
         context: &mut AppContext,
     ) -> bool {
         let layout = self.layout(terminal_rect, font_size, context);
-        if let Err(error) = self.pty.resize(
-            layout.renderer.rows,
-            layout.renderer.cols,
-            layout.pixel_width,
-            layout.pixel_height,
-        ) {
+        if let Err(error) = self.pty.resize(TerminalSize {
+            rows: layout.renderer.rows,
+            cols: layout.renderer.cols,
+            pixel_width: layout.pixel_width,
+            pixel_height: layout.pixel_height,
+        }) {
             tracing::warn!(
                 error = %error,
                 rows = layout.renderer.rows,
@@ -1094,14 +1128,526 @@ impl Drop for Terminal {
 #[cfg(test)]
 mod tests {
     use super::{
-        PAGE_DOWN, PAGE_UP, ReaderPoll, TerminalLayout, application_scroll_sequence,
+        PAGE_DOWN, PAGE_UP, ReaderPoll, ReaderResources, ReaderSharedState, Terminal,
+        TerminalLayout, application_scroll_sequence, apply_pending_renderer_configuration,
         classify_poll_events, cursor_key_sequence, mouse_tap_sequence, normalized_font_size,
-        requests_terminal_hard_refresh, scrollback_target, should_dismiss_terminal_bar,
-        terminal_bar_rects, terminal_pixel_dimensions, toggles_terminal_bar,
+        requests_terminal_hard_refresh, run_terminal_reader, scrollback_target,
+        should_dismiss_terminal_bar, terminal_bar_rects, terminal_pixel_dimensions,
+        toggles_terminal_bar,
     };
+    use crate::context::test_helpers::create_test_context;
+    use crate::device::AppContext;
+    use crate::font::Fonts;
+    use crate::framebuffer::UpdateMode;
     use crate::geom::{Dir, Point, Rectangle};
     use crate::gesture::GestureEvent;
-    use crate::view::terminal::buffer::RendererConfiguration;
+    use crate::view::terminal::buffer::{DoubleBuffer, RendererConfiguration};
+    use crate::view::terminal::emulator::Emulator;
+    use crate::view::terminal::pty::{TerminalPty, TerminalSize};
+    use crate::view::terminal::render::TerminalRenderer;
+    use crate::view::{Bus, Event, KeyboardEvent, RenderQueue, View};
+    use anyhow::{Result, bail};
+    use std::io::{Cursor, Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::{Receiver, channel};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct FakePtyState {
+        writes: Vec<Vec<u8>>,
+        resizes: Vec<TerminalSize>,
+        reader_requests: usize,
+        shutdowns: usize,
+        drops: usize,
+        fail_reader: bool,
+        fail_resize: bool,
+    }
+
+    struct FakePty {
+        state: Arc<Mutex<FakePtyState>>,
+    }
+
+    impl TerminalPty for FakePty {
+        fn take_reader(&self) -> Result<Box<dyn Read + Send>> {
+            let mut state = self.state.lock().expect("fake PTY state poisoned");
+            state.reader_requests += 1;
+            if state.fail_reader {
+                bail!("fake reader failure");
+            }
+            Ok(Box::new(Cursor::new(Vec::new())))
+        }
+
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+
+        fn write(&mut self, data: &[u8]) -> Result<usize> {
+            self.state
+                .lock()
+                .expect("fake PTY state poisoned")
+                .writes
+                .push(data.to_vec());
+            Ok(data.len())
+        }
+
+        fn resize(&self, size: TerminalSize) -> Result<()> {
+            let mut state = self.state.lock().expect("fake PTY state poisoned");
+            if state.fail_resize {
+                bail!("fake resize failure");
+            }
+            state.resizes.push(size);
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> Result<()> {
+            self.state
+                .lock()
+                .expect("fake PTY state poisoned")
+                .shutdowns += 1;
+            Ok(())
+        }
+    }
+
+    impl Drop for FakePty {
+        fn drop(&mut self) {
+            self.state.lock().expect("fake PTY state poisoned").drops += 1;
+        }
+    }
+
+    fn fake_terminal() -> (
+        Terminal,
+        Arc<Mutex<FakePtyState>>,
+        AppContext,
+        crate::view::Hub,
+        Receiver<Event>,
+        RenderQueue,
+    ) {
+        let state = Arc::new(Mutex::new(FakePtyState::default()));
+        let factory_state = Arc::clone(&state);
+        let mut context = create_test_context();
+        context.load_keyboard_layouts();
+        let (hub, receiver) = channel();
+        let mut render_queue = RenderQueue::new();
+        let terminal = Terminal::new_with_dependencies(
+            Rectangle::new(Point::new(0, 0), Point::new(600, 800)),
+            12.0,
+            &mut render_queue,
+            &mut context,
+            &hub,
+            move |_| {
+                Ok(Box::new(FakePty {
+                    state: factory_state,
+                }))
+            },
+            |_| Ok(None),
+        )
+        .expect("failed to construct terminal with fake PTY");
+        render_queue.clear();
+
+        (terminal, state, context, hub, receiver, render_queue)
+    }
+
+    fn handle_terminal_event(
+        terminal: &mut Terminal,
+        event: Event,
+        hub: &crate::view::Hub,
+        render_queue: &mut RenderQueue,
+        context: &mut AppContext,
+    ) -> bool {
+        terminal.handle_event(&event, hub, &mut Bus::new(), render_queue, context)
+    }
+
+    #[test]
+    fn terminal_construction_is_transactional_when_pty_creation_fails() {
+        let mut context = create_test_context();
+        let original_keyboard_rect = context.kb_rect;
+        let (hub, _) = channel();
+        let mut render_queue = RenderQueue::new();
+
+        let result = Terminal::new_with_dependencies(
+            Rectangle::new(Point::new(0, 0), Point::new(600, 800)),
+            12.0,
+            &mut render_queue,
+            &mut context,
+            &hub,
+            |_| bail!("fake PTY creation failure"),
+            |_| Ok(None),
+        );
+
+        assert!(result.is_err());
+        assert!(render_queue.is_empty());
+        assert_eq!(context.kb_rect, original_keyboard_rect);
+    }
+
+    #[test]
+    fn terminal_construction_is_transactional_when_reader_creation_fails() {
+        let state = Arc::new(Mutex::new(FakePtyState {
+            fail_reader: true,
+            ..FakePtyState::default()
+        }));
+        let factory_state = Arc::clone(&state);
+        let mut context = create_test_context();
+        let original_keyboard_rect = context.kb_rect;
+        let (hub, _) = channel();
+        let mut render_queue = RenderQueue::new();
+
+        let result = Terminal::new_with_dependencies(
+            Rectangle::new(Point::new(0, 0), Point::new(600, 800)),
+            12.0,
+            &mut render_queue,
+            &mut context,
+            &hub,
+            move |_| {
+                Ok(Box::new(FakePty {
+                    state: factory_state,
+                }))
+            },
+            |_| Ok(None),
+        );
+
+        assert!(result.is_err());
+        assert!(render_queue.is_empty());
+        assert_eq!(context.kb_rect, original_keyboard_rect);
+        let state = state.lock().expect("fake PTY state poisoned");
+        assert_eq!(state.reader_requests, 1);
+        assert_eq!(state.drops, 1);
+    }
+
+    #[test]
+    fn terminal_construction_is_transactional_when_reader_thread_creation_fails() {
+        let state = Arc::new(Mutex::new(FakePtyState::default()));
+        let factory_state = Arc::clone(&state);
+        let mut context = create_test_context();
+        let original_keyboard_rect = context.kb_rect;
+        let (hub, _) = channel();
+        let mut render_queue = RenderQueue::new();
+
+        let result = Terminal::new_with_dependencies(
+            Rectangle::new(Point::new(0, 0), Point::new(600, 800)),
+            12.0,
+            &mut render_queue,
+            &mut context,
+            &hub,
+            move |_| {
+                Ok(Box::new(FakePty {
+                    state: factory_state,
+                }))
+            },
+            |_| bail!("fake reader thread failure"),
+        );
+
+        assert!(result.is_err());
+        assert!(render_queue.is_empty());
+        assert_eq!(context.kb_rect, original_keyboard_rect);
+        let state = state.lock().expect("fake PTY state poisoned");
+        assert_eq!(state.reader_requests, 1);
+        assert_eq!(state.drops, 1);
+    }
+
+    #[test]
+    fn keyboard_events_are_written_to_the_pty_in_terminal_encoding() {
+        let (mut terminal, state, mut context, hub, _, mut render_queue) = fake_terminal();
+
+        for event in [
+            KeyboardEvent::Append('x'),
+            KeyboardEvent::Submit,
+            KeyboardEvent::Control('c'),
+            KeyboardEvent::Cursor(Dir::North),
+        ] {
+            assert!(handle_terminal_event(
+                &mut terminal,
+                Event::Keyboard(event),
+                &hub,
+                &mut render_queue,
+                &mut context,
+            ));
+        }
+        terminal
+            .emulator
+            .lock()
+            .expect("terminal emulator poisoned")
+            .feed(b"\x1b[?1h");
+        assert!(handle_terminal_event(
+            &mut terminal,
+            Event::Keyboard(KeyboardEvent::Cursor(Dir::South)),
+            &hub,
+            &mut render_queue,
+            &mut context,
+        ));
+
+        assert_eq!(
+            state.lock().expect("fake PTY state poisoned").writes,
+            vec![
+                b"x".to_vec(),
+                b"\r".to_vec(),
+                vec![3],
+                b"\x1b[A".to_vec(),
+                b"\x1bOB".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resize_keeps_pty_emulator_and_renderer_configuration_in_sync() {
+        let (mut terminal, state, mut context, hub, _, mut render_queue) = fake_terminal();
+        let landscape = Rectangle::new(Point::new(0, 0), Point::new(800, 600));
+
+        terminal.resize(landscape, &hub, &mut render_queue, &mut context);
+
+        let expected_size = TerminalSize {
+            rows: terminal.layout.renderer.rows,
+            cols: terminal.layout.renderer.cols,
+            pixel_width: terminal.layout.pixel_width,
+            pixel_height: terminal.layout.pixel_height,
+        };
+        assert_eq!(
+            state
+                .lock()
+                .expect("fake PTY state poisoned")
+                .resizes
+                .last(),
+            Some(&expected_size)
+        );
+        assert_eq!(
+            terminal
+                .emulator
+                .lock()
+                .expect("terminal emulator poisoned")
+                .screen()
+                .size(),
+            (expected_size.rows, expected_size.cols)
+        );
+        assert_eq!(
+            terminal
+                .double_buffer
+                .lock()
+                .expect("terminal buffer poisoned")
+                .take_renderer_configuration(),
+            Some(terminal.layout.renderer)
+        );
+        assert_eq!(terminal.rect, landscape);
+        assert_eq!(terminal.terminal_rect, landscape);
+    }
+
+    #[test]
+    fn failed_pty_resize_preserves_the_active_terminal_layout() {
+        let (mut terminal, state, mut context, hub, _, mut render_queue) = fake_terminal();
+        let previous_layout = terminal.layout;
+        let previous_terminal_rect = terminal.terminal_rect;
+        state.lock().expect("fake PTY state poisoned").fail_resize = true;
+
+        terminal.resize(
+            Rectangle::new(Point::new(0, 0), Point::new(800, 600)),
+            &hub,
+            &mut render_queue,
+            &mut context,
+        );
+
+        assert_eq!(terminal.layout, previous_layout);
+        assert_eq!(terminal.terminal_rect, previous_terminal_rect);
+        assert_eq!(
+            terminal
+                .emulator
+                .lock()
+                .expect("terminal emulator poisoned")
+                .screen()
+                .size(),
+            (previous_layout.renderer.rows, previous_layout.renderer.cols)
+        );
+        assert!(
+            terminal
+                .double_buffer
+                .lock()
+                .expect("terminal buffer poisoned")
+                .take_renderer_configuration()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn renderer_reconstruction_requests_a_full_framebuffer_update() {
+        let (mut terminal, _, mut context, hub, _, mut render_queue) = fake_terminal();
+        terminal
+            .double_buffer
+            .lock()
+            .expect("terminal buffer poisoned")
+            .request_full_refresh();
+
+        assert!(handle_terminal_event(
+            &mut terminal,
+            Event::WakeUp,
+            &hub,
+            &mut render_queue,
+            &mut context,
+        ));
+
+        assert_eq!(
+            render_queue
+                .get(&(UpdateMode::Full, false))
+                .expect("full framebuffer update was not scheduled")
+                .as_slice(),
+            &[(Some(terminal.id), terminal.terminal_rect)]
+        );
+    }
+
+    #[test]
+    fn long_hold_schedules_renderer_reconstruction() {
+        let (mut terminal, _, mut context, hub, _, mut render_queue) = fake_terminal();
+
+        assert!(handle_terminal_event(
+            &mut terminal,
+            Event::Gesture(GestureEvent::HoldFingerLong(Point::new(300, 400), 0)),
+            &hub,
+            &mut render_queue,
+            &mut context,
+        ));
+
+        assert_eq!(
+            terminal
+                .double_buffer
+                .lock()
+                .expect("terminal buffer poisoned")
+                .take_renderer_configuration(),
+            Some(terminal.layout.renderer)
+        );
+    }
+
+    #[test]
+    fn dropping_terminal_shuts_down_the_backend_once() {
+        let (terminal, state, _, _, _, _) = fake_terminal();
+
+        drop(terminal);
+
+        let state = state.lock().expect("fake PTY state poisoned");
+        assert_eq!(state.shutdowns, 1);
+        assert_eq!(state.drops, 1);
+    }
+
+    #[test]
+    fn reader_drains_final_output_before_hangup() -> Result<()> {
+        let root = PathBuf::from(
+            std::env::var("TEST_ROOT_DIR").expect("TEST_ROOT_DIR must be set for this test"),
+        );
+        let (reader, mut peer) = UnixStream::pair()?;
+        peer.write_all(b"done")?;
+        drop(peer);
+        let reader_fd = reader.as_raw_fd();
+        let (double_buffer, buffer_writer) = DoubleBuffer::new(200, 80);
+        let double_buffer = Arc::new(Mutex::new(double_buffer));
+        let emulator = Arc::new(Mutex::new(Emulator::new(2, 10)));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (hub, receiver) = channel();
+        let configuration = RendererConfiguration {
+            font_size: 12 * 64,
+            rows: 2,
+            cols: 10,
+            pixmap_width: 200,
+            pixmap_height: 80,
+        };
+
+        run_terminal_reader(ReaderResources {
+            reader: Box::new(reader),
+            pty_fd: Some(reader_fd),
+            writer: buffer_writer,
+            initial_configuration: configuration,
+            install_dir: root,
+            dpi: 300,
+            shared: ReaderSharedState {
+                hub,
+                buffer: Arc::clone(&double_buffer),
+                emulator: Arc::clone(&emulator),
+                shutdown,
+            },
+        });
+
+        assert_eq!(
+            emulator
+                .lock()
+                .expect("terminal emulator poisoned")
+                .screen()
+                .contents(),
+            "done"
+        );
+        assert!(
+            double_buffer
+                .lock()
+                .expect("terminal buffer poisoned")
+                .is_dirty()
+        );
+        assert!(matches!(receiver.try_recv(), Ok(Event::WakeUp)));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_renderer_configuration_rebuilds_and_publishes_the_frame() {
+        let root = PathBuf::from(
+            std::env::var("TEST_ROOT_DIR").expect("TEST_ROOT_DIR must be set for this test"),
+        );
+        let mut fonts = Fonts::load_from(root).expect("failed to load terminal fonts");
+        let (double_buffer, mut buffer_writer) = DoubleBuffer::new(100, 40);
+        let double_buffer = Arc::new(Mutex::new(double_buffer));
+        let emulator = Arc::new(Mutex::new(Emulator::new(2, 10)));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (hub, receiver) = channel();
+        let initial_configuration = RendererConfiguration {
+            font_size: 12 * 64,
+            rows: 2,
+            cols: 10,
+            pixmap_width: 100,
+            pixmap_height: 40,
+        };
+        let next_configuration = RendererConfiguration {
+            rows: 3,
+            cols: 12,
+            pixmap_width: 240,
+            pixmap_height: 100,
+            ..initial_configuration
+        };
+        {
+            let mut emulator = emulator.lock().expect("terminal emulator poisoned");
+            emulator.resize(next_configuration.rows, next_configuration.cols);
+            emulator.feed(b"rebuilt");
+        }
+        double_buffer
+            .lock()
+            .expect("terminal buffer poisoned")
+            .request_renderer_configuration(next_configuration);
+        let shared = ReaderSharedState {
+            hub,
+            buffer: Arc::clone(&double_buffer),
+            emulator,
+            shutdown,
+        };
+        let mut renderer = TerminalRenderer::new_with_font_size(
+            &mut fonts,
+            initial_configuration.rows,
+            initial_configuration.cols,
+            initial_configuration.font_size,
+            300,
+        );
+
+        apply_pending_renderer_configuration(
+            &mut renderer,
+            &mut buffer_writer,
+            &mut fonts,
+            300,
+            &shared,
+        );
+
+        let mut buffer = double_buffer.lock().expect("terminal buffer poisoned");
+        assert_eq!(
+            (buffer.front.width, buffer.front.height),
+            (
+                next_configuration.pixmap_width,
+                next_configuration.pixmap_height
+            )
+        );
+        assert!(buffer.take_full_refresh());
+        assert!(matches!(receiver.try_recv(), Ok(Event::WakeUp)));
+    }
 
     #[test]
     fn readable_pty_data_takes_precedence_over_hangup() {
