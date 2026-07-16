@@ -9,7 +9,7 @@ use crate::device::DeviceHardware as _;
 use crate::device::DeviceIdentity as _;
 use crate::framebuffer::Framebuffer as _;
 use crate::framebuffer::UpdateMode;
-use crate::geom::Rectangle;
+use crate::geom::{Dir, Rectangle};
 use crate::gesture::GestureEvent;
 use crate::input::DeviceEvent;
 use crate::unit::scale_by_dpi;
@@ -297,19 +297,19 @@ impl View for Keyboard {
                         hub.send(Event::Keyboard(KeyboardEvent::Raw(b"\x1b"))).ok();
                     }
                     KeyKind::ArrowUp => {
-                        hub.send(Event::Keyboard(KeyboardEvent::Raw(b"\x1b[A")))
+                        hub.send(Event::Keyboard(KeyboardEvent::Cursor(Dir::North)))
                             .ok();
                     }
                     KeyKind::ArrowDown => {
-                        hub.send(Event::Keyboard(KeyboardEvent::Raw(b"\x1b[B")))
+                        hub.send(Event::Keyboard(KeyboardEvent::Cursor(Dir::South)))
                             .ok();
                     }
                     KeyKind::ArrowRight => {
-                        hub.send(Event::Keyboard(KeyboardEvent::Raw(b"\x1b[C")))
+                        hub.send(Event::Keyboard(KeyboardEvent::Cursor(Dir::East)))
                             .ok();
                     }
                     KeyKind::ArrowLeft => {
-                        hub.send(Event::Keyboard(KeyboardEvent::Raw(b"\x1b[D")))
+                        hub.send(Event::Keyboard(KeyboardEvent::Cursor(Dir::West)))
                             .ok();
                     }
                     KeyKind::Control => {
