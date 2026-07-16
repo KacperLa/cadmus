@@ -335,8 +335,9 @@ fn apply_pending_renderer_configuration(
     );
     writer.back = Pixmap::new(configuration.pixmap_width, configuration.pixmap_height, 1);
     if let Ok(emulator) = shared.emulator.lock() {
-        renderer.render_screen(emulator.screen(), &mut writer.back, fonts);
+        renderer.reconstruct_screen(emulator.screen(), &mut writer.back, fonts);
     }
+    writer.dirty_rect = None;
     if let Ok(mut buffer) = shared.buffer.lock() {
         buffer.swap(writer);
         buffer.request_full_refresh();
@@ -624,6 +625,12 @@ impl Terminal {
             context.settings.terminal.font_size = font_size;
         }
         true
+    }
+
+    fn request_render_reconstruction(&self) {
+        if let Ok(mut buffer) = self.double_buffer.lock() {
+            buffer.request_renderer_configuration(self.layout.renderer);
+        }
     }
 
     fn send_mouse_tap(&mut self, point: Point) -> bool {
@@ -930,7 +937,7 @@ impl View for Terminal {
                 true
             }
             Event::Gesture(gesture) if requests_terminal_hard_refresh(gesture, self.rect) => {
-                rq.add(RenderData::expose(self.rect, UpdateMode::Full));
+                self.request_render_reconstruction();
                 true
             }
             Event::Gesture(GestureEvent::Swipe { dir, start, end })
@@ -957,7 +964,7 @@ impl View for Terminal {
                         rq.add(RenderData::no_wait(
                             self.id,
                             self.terminal_rect,
-                            UpdateMode::Gui,
+                            UpdateMode::Full,
                         ));
                     } else {
                         for dirty_rect in buffer.drain_dirty_rects() {
