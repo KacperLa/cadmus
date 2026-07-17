@@ -736,9 +736,10 @@ pub enum KeyboardEvent {
     Partial(char),
     Move { target: TextKind, dir: LinearDir },
     Delete { target: TextKind, dir: LinearDir },
-    Cursor(Dir),
+    Arrow(Dir),
     Submit,
-    Raw(&'static [u8]),
+    Tab,
+    Escape,
     Control(char),
 }
 
