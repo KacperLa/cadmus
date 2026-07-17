@@ -173,41 +173,31 @@ impl Keyboard {
 
         if self.state.shift == 1 {
             self.state.shift = 0;
-            for child in self.children_mut() {
-                if let Some(key) = child.downcast_mut::<Key>() {
-                    if *key.kind() == KeyKind::Shift {
-                        key.release(rq);
-                        break;
-                    }
-                }
-            }
+            self.release_key(KeyKind::Shift, rq);
         }
 
         if self.state.alternate == 1 {
             self.state.alternate = 0;
-            for child in self.children_mut() {
-                if let Some(key) = child.downcast_mut::<Key>() {
-                    if *key.kind() == KeyKind::Alternate {
-                        key.release(rq);
-                        break;
-                    }
-                }
-            }
+            self.release_key(KeyKind::Alternate, rq);
         }
 
         if self.state.control == 1 {
             self.state.control = 0;
-            for child in self.children_mut() {
-                if let Some(key) = child.downcast_mut::<Key>() {
-                    if *key.kind() == KeyKind::Control {
-                        key.release(rq);
-                        break;
-                    }
-                }
-            }
+            self.release_key(KeyKind::Control, rq);
         }
 
         self.update(rq);
+    }
+
+    fn release_key(&mut self, kind: KeyKind, rq: &mut RenderQueue) {
+        if let Some(key) = self
+            .children_mut()
+            .iter_mut()
+            .filter_map(|child| child.downcast_mut::<Key>())
+            .find(|key| *key.kind() == kind)
+        {
+            key.release(rq);
+        }
     }
 
     fn release_combine(&mut self, rq: &mut RenderQueue) {
@@ -291,25 +281,25 @@ impl View for Keyboard {
                         hub.send(Event::Keyboard(KeyboardEvent::Submit)).ok();
                     }
                     KeyKind::Tab => {
-                        hub.send(Event::Keyboard(KeyboardEvent::Raw(b"\t"))).ok();
+                        hub.send(Event::Keyboard(KeyboardEvent::Tab)).ok();
                     }
                     KeyKind::Escape => {
-                        hub.send(Event::Keyboard(KeyboardEvent::Raw(b"\x1b"))).ok();
+                        hub.send(Event::Keyboard(KeyboardEvent::Escape)).ok();
                     }
                     KeyKind::ArrowUp => {
-                        hub.send(Event::Keyboard(KeyboardEvent::Cursor(Dir::North)))
+                        hub.send(Event::Keyboard(KeyboardEvent::Arrow(Dir::North)))
                             .ok();
                     }
                     KeyKind::ArrowDown => {
-                        hub.send(Event::Keyboard(KeyboardEvent::Cursor(Dir::South)))
+                        hub.send(Event::Keyboard(KeyboardEvent::Arrow(Dir::South)))
                             .ok();
                     }
                     KeyKind::ArrowRight => {
-                        hub.send(Event::Keyboard(KeyboardEvent::Cursor(Dir::East)))
+                        hub.send(Event::Keyboard(KeyboardEvent::Arrow(Dir::East)))
                             .ok();
                     }
                     KeyKind::ArrowLeft => {
-                        hub.send(Event::Keyboard(KeyboardEvent::Cursor(Dir::West)))
+                        hub.send(Event::Keyboard(KeyboardEvent::Arrow(Dir::West)))
                             .ok();
                     }
                     KeyKind::Control => {

@@ -908,7 +908,7 @@ impl View for Terminal {
                     }
                     KeyboardEvent::Submit => b"\r",
                     KeyboardEvent::Delete { .. } => &[127],
-                    KeyboardEvent::Cursor(dir) => {
+                    KeyboardEvent::Arrow(dir) => {
                         let application_cursor = match self.emulator.lock() {
                             Ok(emulator) => emulator.application_cursor(),
                             Err(error) => {
@@ -918,7 +918,8 @@ impl View for Terminal {
                         };
                         cursor_key_sequence(dir, application_cursor)
                     }
-                    KeyboardEvent::Raw(b) => b,
+                    KeyboardEvent::Tab => b"\t",
+                    KeyboardEvent::Escape => b"\x1b",
                     KeyboardEvent::Control(ch) => {
                         let ctrl_byte = ch.to_ascii_uppercase() as u8 - b'A' + 1;
                         let _ = self.pty.write(&[ctrl_byte]);
@@ -1354,8 +1355,10 @@ mod tests {
         for event in [
             KeyboardEvent::Append('x'),
             KeyboardEvent::Submit,
+            KeyboardEvent::Tab,
+            KeyboardEvent::Escape,
             KeyboardEvent::Control('c'),
-            KeyboardEvent::Cursor(Dir::North),
+            KeyboardEvent::Arrow(Dir::North),
         ] {
             assert!(handle_terminal_event(
                 &mut terminal,
@@ -1372,7 +1375,7 @@ mod tests {
             .feed(b"\x1b[?1h");
         assert!(handle_terminal_event(
             &mut terminal,
-            Event::Keyboard(KeyboardEvent::Cursor(Dir::South)),
+            Event::Keyboard(KeyboardEvent::Arrow(Dir::South)),
             &hub,
             &mut render_queue,
             &mut context,
@@ -1383,6 +1386,8 @@ mod tests {
             vec![
                 b"x".to_vec(),
                 b"\r".to_vec(),
+                b"\t".to_vec(),
+                b"\x1b".to_vec(),
                 vec![3],
                 b"\x1b[A".to_vec(),
                 b"\x1bOB".to_vec(),
