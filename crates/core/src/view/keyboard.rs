@@ -292,25 +292,26 @@ impl View for Keyboard {
                             .ok();
                     }
                     KeyKind::Tab => {
-                        hub.send(Event::Keyboard(KeyboardEvent::Raw(b"\t"))).ok();
+                        hub.send((Event::Keyboard(KeyboardEvent::Tab)).into()).ok();
                     }
                     KeyKind::Escape => {
-                        hub.send(Event::Keyboard(KeyboardEvent::Raw(b"\x1b"))).ok();
+                        hub.send((Event::Keyboard(KeyboardEvent::Escape)).into())
+                            .ok();
                     }
                     KeyKind::ArrowUp => {
-                        hub.send(Event::Keyboard(KeyboardEvent::Cursor(Dir::North)))
+                        hub.send((Event::Keyboard(KeyboardEvent::Arrow(Dir::North))).into())
                             .ok();
                     }
                     KeyKind::ArrowDown => {
-                        hub.send(Event::Keyboard(KeyboardEvent::Cursor(Dir::South)))
+                        hub.send((Event::Keyboard(KeyboardEvent::Arrow(Dir::South))).into())
                             .ok();
                     }
                     KeyKind::ArrowRight => {
-                        hub.send(Event::Keyboard(KeyboardEvent::Cursor(Dir::East)))
+                        hub.send((Event::Keyboard(KeyboardEvent::Arrow(Dir::East))).into())
                             .ok();
                     }
                     KeyKind::ArrowLeft => {
-                        hub.send(Event::Keyboard(KeyboardEvent::Cursor(Dir::West)))
+                        hub.send((Event::Keyboard(KeyboardEvent::Arrow(Dir::West))).into())
                             .ok();
                     }
                     KeyKind::Control => {
