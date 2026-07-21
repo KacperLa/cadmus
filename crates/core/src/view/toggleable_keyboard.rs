@@ -14,6 +14,8 @@ use crate::view::keyboard::Keyboard;
 use crate::view::{BIG_BAR_HEIGHT, SMALL_BAR_HEIGHT, THICKNESS_MEDIUM};
 use crate::view::{Bus, Event, Hub, ID_FEEDER, Id, RenderData, RenderQueue, View};
 
+include!(concat!(env!("OUT_DIR"), "/keyboard_layouts.rs"));
+
 /// A view component that wraps a keyboard and provides toggle functionality.
 ///
 /// This component manages a keyboard view along with a separator line,
@@ -39,7 +41,7 @@ pub struct ToggleableKeyboard {
     visible: bool,
     parent_rect: Rectangle,
     number_mode: bool,
-    layout: Option<String>,
+    layout: Option<Layout>,
     has_bottom_bar: bool,
 }
 
@@ -77,9 +79,9 @@ impl ToggleableKeyboard {
     ///
     /// # Arguments
     ///
-    /// * `layout` - The name of the keyboard layout (e.g., "Terminal")
-    pub fn with_layout(mut self, layout: impl Into<String>) -> Self {
-        self.layout = Some(layout.into());
+    /// * `layout` - The keyboard layout to display
+    pub fn with_layout(mut self, layout: Layout) -> Self {
+        self.layout = Some(layout);
         self
     }
 
@@ -219,9 +221,9 @@ impl ToggleableKeyboard {
             self.parent_rect.max.y - bottom_offset
         ];
 
-        let saved_layout = self.layout.as_ref().map(|layout| {
+        let saved_layout = self.layout.map(|layout| {
             let saved = context.settings.keyboard_layout.clone();
-            context.settings.keyboard_layout = layout.clone();
+            context.settings.keyboard_layout = layout.to_string();
             saved
         });
 
@@ -389,8 +391,8 @@ mod tests {
     #[test]
     fn test_with_layout_sets_custom_layout() {
         let parent_rect = rect![0, 0, 600, 800];
-        let keyboard = ToggleableKeyboard::new(parent_rect, false).with_layout("Terminal");
-        assert_eq!(keyboard.layout, Some("Terminal".to_string()));
+        let keyboard = ToggleableKeyboard::new(parent_rect, false).with_layout(Layout::Terminal);
+        assert_eq!(keyboard.layout, Some(Layout::Terminal));
     }
 
     #[test]
@@ -439,10 +441,10 @@ mod tests {
     fn test_builder_chaining() {
         let parent_rect = rect![0, 0, 600, 800];
         let keyboard = ToggleableKeyboard::new(parent_rect, false)
-            .with_layout("Terminal")
+            .with_layout(Layout::Terminal)
             .with_bottom_bar(false);
 
-        assert_eq!(keyboard.layout, Some("Terminal".to_string()));
+        assert_eq!(keyboard.layout, Some(Layout::Terminal));
         assert!(!keyboard.has_bottom_bar);
     }
 
