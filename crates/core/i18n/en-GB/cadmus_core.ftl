@@ -9,6 +9,20 @@ build-features = Features: { $features }
 
 english = English
 
+# Keyboard
+
+keyboard-key-alternate = ALT
+keyboard-key-arrow-down = ▼
+keyboard-key-arrow-left = ◀
+keyboard-key-arrow-right = ▶
+keyboard-key-arrow-up = ▲
+keyboard-key-combine = CMB
+keyboard-key-control = CTRL
+keyboard-key-escape = ESC
+keyboard-key-return = RETURN
+keyboard-key-shift = SHIFT
+keyboard-key-tab = TAB
+
 startup-loading = Cadmus starting up…
 
 # Notifications
