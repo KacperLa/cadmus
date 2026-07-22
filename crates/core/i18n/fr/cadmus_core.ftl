@@ -10,19 +10,6 @@ build-features = Nouveautés : { $features }
 build-kind-main = Main
 build-kind-test = Test
 english = Anglais
-
-# Keyboard
-keyboard-key-alternate = ALT
-keyboard-key-arrow-down = ▼
-keyboard-key-arrow-left = ◀
-keyboard-key-arrow-right = ▶
-keyboard-key-arrow-up = ▲
-keyboard-key-combine = CMB
-keyboard-key-control = CTRL
-keyboard-key-escape = ÉCHAP
-keyboard-key-return = ENTRÉE
-keyboard-key-shift = MAJ
-keyboard-key-tab = TAB
 startup-loading = Cadmus démarre…
 
 # Notifications
