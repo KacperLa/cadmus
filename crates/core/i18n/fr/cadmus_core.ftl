@@ -1,19 +1,6 @@
 # Keep the message ID's sorted please.
 
 english = Anglais
-
-# Keyboard
-keyboard-key-alternate = ALT
-keyboard-key-arrow-down = ▼
-keyboard-key-arrow-left = ◀
-keyboard-key-arrow-right = ▶
-keyboard-key-arrow-up = ▲
-keyboard-key-combine = CMB
-keyboard-key-control = CTRL
-keyboard-key-escape = ÉCHAP
-keyboard-key-return = ENTRÉE
-keyboard-key-shift = MAJ
-keyboard-key-tab = TAB
 startup-loading = Cadmus démarre…
 
 # Notifications
