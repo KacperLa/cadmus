@@ -68,7 +68,7 @@ use crate::document::{Location, TextLocation};
 use crate::framebuffer::Framebuffer as _;
 use crate::framebuffer::UpdateMode;
 use crate::frontlight::LightLevels;
-use crate::geom::{Boundary, CycleDir, LinearDir, Rectangle};
+use crate::geom::{Boundary, CycleDir, Dir, LinearDir, Rectangle};
 use crate::gesture::GestureEvent;
 use crate::input::{DeviceEvent, FingerStatus};
 use crate::metadata::{
@@ -787,7 +787,11 @@ pub enum KeyboardEvent {
     Partial(char),
     Move { target: TextKind, dir: LinearDir },
     Delete { target: TextKind, dir: LinearDir },
+    Arrow(Dir),
     Submit,
+    Tab,
+    Escape,
+    Control(char),
 }
 
 #[derive(Debug, Copy, Clone)]
