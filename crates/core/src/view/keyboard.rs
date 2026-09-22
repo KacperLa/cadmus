@@ -28,12 +28,51 @@ pub struct Layout {
     pub widths: Vec<Vec<f32>>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ModifierState {
+    #[default]
+    Off,
+    Once,
+    Locked,
+}
+
+impl ModifierState {
+    fn is_engaged(self) -> bool {
+        !matches!(self, ModifierState::Off)
+    }
+
+    fn is_once(self) -> bool {
+        matches!(self, ModifierState::Once)
+    }
+
+    fn is_locked(self) -> bool {
+        matches!(self, ModifierState::Locked)
+    }
+
+    fn cycle(self) -> ModifierState {
+        match self {
+            ModifierState::Off => ModifierState::Once,
+            ModifierState::Once => ModifierState::Locked,
+            ModifierState::Locked => ModifierState::Off,
+        }
+    }
+
+    /// Releases a pending single-press modifier, leaving locked ones engaged.
+    fn release(self) -> ModifierState {
+        if self.is_once() {
+            ModifierState::Off
+        } else {
+            self
+        }
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct State {
-    shift: u8,
-    alternate: u8,
+    shift: ModifierState,
+    alternate: ModifierState,
     combine: bool,
-    control: u8,
+    control: ModifierState,
 }
 
 pub struct Keyboard {
@@ -56,16 +95,16 @@ impl Keyboard {
         let mut state = State::default();
 
         if number {
-            state.alternate = 2;
+            state.alternate = ModifierState::Locked;
         }
 
         let mut level = 0;
 
-        if state.shift > 0 {
+        if state.shift.is_engaged() {
             level += 1;
         }
 
-        if state.alternate > 0 {
+        if state.alternate.is_engaged() {
             level += 2;
         }
 
@@ -139,11 +178,11 @@ impl Keyboard {
     fn update(&mut self, rq: &mut RenderQueue) {
         let mut level = 0;
 
-        if self.state.shift > 0 {
+        if self.state.shift.is_engaged() {
             level += 1;
         }
 
-        if self.state.alternate > 0 {
+        if self.state.alternate.is_engaged() {
             level += 2;
         }
 
@@ -167,22 +206,25 @@ impl Keyboard {
     }
 
     fn release_modifiers(&mut self, rq: &mut RenderQueue) {
-        if self.state.shift != 1 && self.state.alternate != 1 && self.state.control != 1 {
+        if !self.state.shift.is_once()
+            && !self.state.alternate.is_once()
+            && !self.state.control.is_once()
+        {
             return;
         }
 
-        if self.state.shift == 1 {
-            self.state.shift = 0;
+        if self.state.shift.is_once() {
+            self.state.shift = self.state.shift.release();
             self.release_key(KeyKind::Shift, rq);
         }
 
-        if self.state.alternate == 1 {
-            self.state.alternate = 0;
+        if self.state.alternate.is_once() {
+            self.state.alternate = self.state.alternate.release();
             self.release_key(KeyKind::Alternate, rq);
         }
 
-        if self.state.control == 1 {
-            self.state.control = 0;
+        if self.state.control.is_once() {
+            self.state.control = self.state.control.release();
             self.release_key(KeyKind::Control, rq);
         }
 
@@ -228,7 +270,7 @@ impl View for Keyboard {
             Event::Key(k) => {
                 match k {
                     KeyKind::Output(ch) => {
-                        if self.state.control > 0 && ch.is_ascii_alphabetic() {
+                        if self.state.control.is_engaged() && ch.is_ascii_alphabetic() {
                             hub.send((Event::Keyboard(KeyboardEvent::Control(ch))).into())
                                 .ok();
                             self.release_modifiers(rq);
@@ -254,14 +296,14 @@ impl View for Keyboard {
                         }
                     }
                     KeyKind::Shift => {
-                        self.state.shift = (self.state.shift + 1) % 3;
-                        if self.state.shift != 2 {
+                        self.state.shift = self.state.shift.cycle();
+                        if !self.state.shift.is_locked() {
                             self.update(rq);
                         }
                     }
                     KeyKind::Alternate => {
-                        self.state.alternate = (self.state.alternate + 1) % 3;
-                        if self.state.alternate != 2 {
+                        self.state.alternate = self.state.alternate.cycle();
+                        if !self.state.alternate.is_locked() {
                             self.update(rq);
                         }
                     }
@@ -315,8 +357,8 @@ impl View for Keyboard {
                             .ok();
                     }
                     KeyKind::Control => {
-                        self.state.control = (self.state.control + 1) % 3;
-                        if self.state.control != 2 {
+                        self.state.control = self.state.control.cycle();
+                        if !self.state.control.is_locked() {
                             self.update(rq);
                         }
                     }
@@ -328,7 +370,8 @@ impl View for Keyboard {
                     context.settings.keyboard_layout = name.to_string();
                     // FIXME: the keyboard's height might change, in which case,
                     // we shall notify the root view.
-                    *self = Keyboard::new(&mut self.rect, self.state.alternate == 2, context);
+                    *self =
+                        Keyboard::new(&mut self.rect, self.state.alternate.is_locked(), context);
                     rq.add(RenderData::new(self.id, self.rect, UpdateMode::Gui));
                 }
                 true
@@ -608,4 +651,46 @@ lazy_static! {
         m.insert("tm", '™');
         m
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modifier_state_off_is_not_engaged() {
+        assert!(!ModifierState::Off.is_engaged());
+        assert!(!ModifierState::Off.is_once());
+        assert!(!ModifierState::Off.is_locked());
+    }
+
+    #[test]
+    fn modifier_state_once_is_engaged_and_releases() {
+        assert!(ModifierState::Once.is_engaged());
+        assert!(ModifierState::Once.is_once());
+        assert_eq!(ModifierState::Once.release(), ModifierState::Off);
+    }
+
+    #[test]
+    fn modifier_state_locked_is_engaged_and_stays_engaged() {
+        assert!(ModifierState::Locked.is_engaged());
+        assert!(ModifierState::Locked.is_locked());
+        assert_eq!(ModifierState::Locked.release(), ModifierState::Locked);
+    }
+
+    #[test]
+    fn modifier_state_cycles_off_once_locked() {
+        assert_eq!(ModifierState::Off.cycle(), ModifierState::Once);
+        assert_eq!(ModifierState::Once.cycle(), ModifierState::Locked);
+        assert_eq!(ModifierState::Locked.cycle(), ModifierState::Off);
+    }
+
+    #[test]
+    fn state_defaults_to_off() {
+        let state = State::default();
+        assert_eq!(state.shift, ModifierState::Off);
+        assert_eq!(state.alternate, ModifierState::Off);
+        assert_eq!(state.control, ModifierState::Off);
+        assert!(!state.combine);
+    }
 }
