@@ -682,7 +682,7 @@ pub fn run() -> Result<(), Error> {
                             error!(error = %error, application = "terminal", "Failed to launch application");
                             let notification = Notification::new(
                                 None,
-                                "Failed to open terminal".to_string(),
+                                cadmus_core::view::terminal::open_failed_message(),
                                 false,
                                 &tx,
                                 &mut rq,
