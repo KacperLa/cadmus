@@ -676,6 +676,9 @@ pub fn run() -> Result<(), Error> {
                     ) {
                         Ok(terminal) => Box::new(terminal),
                         Err(error) => {
+                            if cfg!(feature = "emulator") {
+                                panic!("Failed to open terminal: {error:#}");
+                            }
                             error!(error = %error, application = "terminal", "Failed to launch application");
                             let notification = Notification::new(
                                 None,

@@ -661,6 +661,46 @@ impl Terminal {
         true
     }
 
+    /// Publishes output produced by the reader thread since the last wake-up.
+    ///
+    /// The reader thread renders into the back buffer and signals progress with
+    /// [`Event::WakeUp`]; this drains that buffer into the render queue so the
+    /// terminal draws its new frame itself. Handled without capturing the event
+    /// so it keeps bubbling up the view chain.
+    fn publish_pending_output(&self, rq: &mut RenderQueue) {
+        let Ok(mut buffer) = self.double_buffer.lock() else {
+            return;
+        };
+        if !buffer.is_dirty() {
+            return;
+        }
+        if buffer.take_full_refresh() {
+            rq.add(RenderData::no_wait(
+                self.id,
+                self.terminal_rect,
+                UpdateMode::Full,
+            ));
+            return;
+        }
+        for dirty_rect in buffer.drain_dirty_rects() {
+            let update_rect = Rectangle::new(
+                Point::new(
+                    self.terminal_rect.min.x + dirty_rect.min.x,
+                    self.terminal_rect.min.y + dirty_rect.min.y,
+                ),
+                Point::new(
+                    self.terminal_rect.min.x + dirty_rect.max.x,
+                    self.terminal_rect.min.y + dirty_rect.max.y,
+                ),
+            );
+            rq.add(RenderData::no_wait(
+                self.id,
+                update_rect,
+                UpdateMode::FastMono,
+            ));
+        }
+    }
+
     fn request_render_reconstruction(&self) {
         if let Ok(mut buffer) = self.double_buffer.lock() {
             buffer.request_renderer_configuration(self.layout.renderer);
@@ -991,36 +1031,8 @@ impl View for Terminal {
             }
             Event::Gesture(GestureEvent::Tap(point)) => self.send_mouse_tap(point),
             Event::WakeUp => {
-                if let Ok(mut buffer) = self.double_buffer.lock()
-                    && buffer.is_dirty()
-                {
-                    if buffer.take_full_refresh() {
-                        rq.add(RenderData::no_wait(
-                            self.id,
-                            self.terminal_rect,
-                            UpdateMode::Full,
-                        ));
-                    } else {
-                        for dirty_rect in buffer.drain_dirty_rects() {
-                            let update_rect = Rectangle::new(
-                                Point::new(
-                                    self.terminal_rect.min.x + dirty_rect.min.x,
-                                    self.terminal_rect.min.y + dirty_rect.min.y,
-                                ),
-                                Point::new(
-                                    self.terminal_rect.min.x + dirty_rect.max.x,
-                                    self.terminal_rect.min.y + dirty_rect.max.y,
-                                ),
-                            );
-                            rq.add(RenderData::no_wait(
-                                self.id,
-                                update_rect,
-                                UpdateMode::FastMono,
-                            ));
-                        }
-                    }
-                }
-                true
+                self.publish_pending_output(rq);
+                false
             }
             _ => false,
         }
@@ -1459,7 +1471,7 @@ mod tests {
     }
 
     #[test]
-    fn renderer_reconstruction_requests_a_full_framebuffer_update() {
+    fn wake_up_publishes_output_without_capturing_the_event() {
         let (mut terminal, _, mut context, hub, _, mut render_queue) = fake_terminal();
         terminal
             .double_buffer
@@ -1467,7 +1479,7 @@ mod tests {
             .expect("terminal buffer poisoned")
             .request_full_refresh();
 
-        assert!(handle_terminal_event(
+        assert!(!handle_terminal_event(
             &mut terminal,
             Event::WakeUp,
             &hub,
