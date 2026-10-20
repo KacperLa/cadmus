@@ -23,49 +23,49 @@ This guide covers setup on both Linux and macOS.
 2. Build the custom SQLite library (required before any Cargo compile):
 
    ```bash
-   cargo xtask setup
+   cadmuscli setup
    ```
 
    > [!NOTE]
    > Cadmus needs a custom SQLite build with `DELETE … LIMIT` support.
    > `libsqlite3-sys` runs before `cadmus-core`'s `build.rs`, so these
-   > artifacts must already exist. Default `cargo xtask setup` (no flags)
+   > artifacts must already exist. Default `cadmuscli setup` (no flags)
    > builds for the host and Kobo targets.
    >
    > Other thirdparty C/C++ dependencies (MuPDF, libwebp, zlib, etc.) are
    > tracked as git submodules and built automatically by `build.rs` when
-   > you run `cargo build` or `cargo xtask run-emulator`. Library inventory
+   > you run `cargo build` or `cadmuscli run-emulator`. Library inventory
    > and per-library notes: [Third-party libraries](thirdparty/index.md).
    > Patch tiers and apply order: [Patch tiers](thirdparty/patches.md).
 
 3. Download the packaged runtime assets used by Kobo builds:
 
    ```bash
-   cargo xtask download-assets
-   cargo xtask download-fonts
+   cadmuscli download-assets
+   cadmuscli download-fonts
    ```
 
    > [!NOTE]
    > `cadmus-core` generates some compile-time metadata from the bundled asset
    > directories. For Kobo builds, make sure `bin/`, `resources/`,
    > `hyphenation-patterns/`, and `fonts/` are present before
-   > `cargo xtask build-kobo` so the generated asset list is complete.
+   > `cadmuscli build-kobo` so the generated asset list is complete.
 
 4. Run the emulator:
 
    ```bash
-   cargo xtask run-emulator
+   cadmuscli run-emulator
    ```
 
 ## Emulator GitHub Authentication
 
-Debug builds (`cargo xtask run-emulator`) can skip GitHub device flow by setting
+Debug builds (`cadmuscli run-emulator`) can skip GitHub device flow by setting
 `GH_TOKEN` to a personal access token with `public_repo` (or the broader `repo`)
 scope:
 
 ```bash
 export GH_TOKEN=ghp_…
-cargo xtask run-emulator
+cadmuscli run-emulator
 ```
 
 Cadmus reads `GH_TOKEN` first, trims whitespace, and ignores an empty value. If
@@ -77,30 +77,41 @@ writes). Release builds never read `GH_TOKEN`.
 
 Once inside the devenv shell, these commands are available:
 
-| Command                       | Description                                                 |
-| ----------------------------- | ----------------------------------------------------------- |
-| `cargo xtask setup`           | Build custom SQLite for host and Kobo (run before compile)  |
-| `cargo xtask download-assets` | Download packaged Plato runtime assets                      |
-| `cargo xtask download-fonts`  | Download bundled font files into `fonts/`                   |
-| `cargo xtask test`            | Run the test suite across the feature matrix                |
-| `cargo xtask run-emulator`    | Run the emulator                                            |
-| `cargo xtask build-kobo`      | Cross-compile for Kobo device                               |
-| `cargo xtask dist`            | Assemble the Kobo distribution directory                    |
-| `cargo xtask bundle`          | Package KoboRoot.tgz for installation                       |
-| `cadmus-dev-otel`             | Run emulator with tracing and profiling enabled             |
-| `devenv up`                   | Start observability stack (Grafana, Tempo, Loki)            |
-| `cargo xtask docs`            | Build docs site (mdBook, API docs, website)                 |
-| `cadmus-docs-serve`           | Serve website locally on port 3000                          |
-| `cadmus-docs-preview`         | `wrangler dev` for `website/out` (Workers, matches CI)      |
-| `cadmus-translate`            | Generate the docs translation template (.pot)               |
-| `cadmus-test-coverage`        | Run tests with coverage instrumentation                     |
-| `cadmus-coverage-show`        | Open project-wide HTML coverage report                      |
-| `cadmus-coverage-diff`        | Open patch coverage HTML vs `origin/$CADMUS_DEFAULT_BRANCH` |
+| Command                     | Description                                                 |
+| --------------------------- | ----------------------------------------------------------- |
+| `cadmuscli setup`           | Build custom SQLite for host and Kobo (run before compile)  |
+| `cadmuscli download-assets` | Download packaged Plato runtime assets                      |
+| `cadmuscli download-fonts`  | Download bundled font files into `fonts/`                   |
+| `cadmuscli test`            | Run the test suite across the feature matrix                |
+| `cadmuscli run-emulator`    | Run the emulator                                            |
+| `cadmuscli build-kobo`      | Cross-compile for Kobo device                               |
+| `cadmuscli dist`            | Assemble the Kobo distribution directory                    |
+| `cadmuscli bundle`          | Package KoboRoot.tgz for installation                       |
+| `cadmus-dev-otel`           | Run emulator with tracing and profiling enabled             |
+| `devenv up`                 | Start observability stack (Grafana, Tempo, Loki)            |
+| `cadmuscli docs`            | Build docs site (mdBook, API docs, website)                 |
+| `cadmus-docs-serve`         | Serve website locally on port 3000                          |
+| `cadmus-docs-preview`       | `wrangler dev` for `website/out` (Workers, matches CI)      |
+| `cadmus-translate`          | Generate the docs translation template (.pot)               |
+| `cadmus-test-coverage`      | Run tests with coverage instrumentation                     |
+| `cadmus-coverage-show`      | Open project-wide HTML coverage report                      |
+| `cadmus-coverage-diff`      | Open patch coverage HTML vs `origin/$CADMUS_DEFAULT_BRANCH` |
 
-Run `cargo xtask --help` to see all available subcommands, or `cargo xtask <cmd> --help` for
-options on a specific command.
+Run `cadmuscli --help` to see all available subcommands, or `cadmuscli <cmd> --help` for
+options on a specific command. `cargo xtask` still works as a debug `cargo run` alias.
+Entering the devenv shell installs a release `cadmuscli` onto `PATH` when `xtask/` sources
+change or the binary is missing (`devenv tasks run cadmuscli:install`).
 
-Or have a look at the rustdocs for `xtask` <a href="/api/xtask/">here</a>.
+Devenv sets `CADMUS_WORKSPACE_ROOT` to the workspace root (same as
+`TEST_ROOT_DIR`). Set it yourself only when running a PATH `cadmuscli`
+outside devenv from outside the repository: it must be a Cadmus workspace
+(`Cargo.toml` `[workspace]` whose `members` include `"xtask"`). Relative
+paths resolve against the process current directory. A wrong value is an
+error; `cadmuscli` does not search further. Inside the repo without devenv,
+`CARGO_MANIFEST_DIR` (from the debug `cargo xtask` alias) or walking up from
+cwd is enough.
+
+Or have a look at the rustdocs for `xtask_lib` <a href="/api/xtask_lib/">here</a>.
 
 ## Tasks
 
@@ -109,12 +120,18 @@ Tasks are defined in `devenv.nix` and can be run with `devenv tasks run <task>`.
 
 ### Available Tasks
 
-| Task         | Description                                               | Dependencies |
-| ------------ | --------------------------------------------------------- | ------------ |
-| `docs:build` | Build documentation EPUB (only rebuilds if files changed) | None         |
-| `build:kobo` | Build for Kobo device                                     | `docs:build` |
+| Task                | What it runs                                                      | Dependencies        |
+| ------------------- | ----------------------------------------------------------------- | ------------------- |
+| `cadmuscli:install` | `cargo build -p xtask --release` and link onto PATH               | None                |
+| `website:install`   | `npm install` in `website/`                                       | None                |
+| `docs:build`        | `cadmuscli docs --mdbook-only`                                    | `cadmuscli:install` |
+| `build:kobo`        | `cadmuscli build-kobo`                                            | `docs:build`        |
 
-All tasks delegate to `cargo xtask` under the hood.
+`cadmuscli:install` builds the release binary; it does not call `cadmuscli`.
+`website:install` only installs website npm dependencies. `docs:build` and
+`build:kobo` invoke `cadmuscli`. `cadmuscli:install` and `website:install` run
+before `devenv:enterShell`. `cadmuscli:install` also runs before `docs:build`,
+and reruns when xtask sources change or the PATH binary is missing.
 
 ### How Tasks Work
 
@@ -125,14 +142,16 @@ Tasks with dependencies automatically run their dependencies first. For example:
 devenv tasks run build:kobo
 ```
 
-The `docs:build` task uses `execIfModified` to only rebuild when documentation files have actually changed.
+`docs:build` uses `execIfModified` so it only rebuilds when documentation files
+have changed. `website:install` uses `execIfModified` on `website/package.json`
+and `website/package-lock.json`.
 
 ## Kobo Build Notes
 
-- Run `cargo xtask setup` before host-side Cargo commands. `cargo xtask
+- Run `cadmuscli setup` before host-side Cargo commands. `cadmuscli
   build-kobo` also ensures the ARM SQLite artifacts, but running setup up
   front covers both native and device paths.
-- `cargo xtask download-assets` and `cargo xtask download-fonts` must run before `cargo xtask build-kobo`.
+- `cadmuscli download-assets` and `cadmuscli download-fonts` must run before `cadmuscli build-kobo`.
 - OTA updates delete Cadmus-owned bundled files before reboot, then Kobo
   extracts the new `KoboRoot.tgz` over the install directory.
 - User files outside the generated Cadmus-owned asset list must be preserved.
@@ -146,17 +165,17 @@ Tests require the `TEST_ROOT_DIR` environment variable to be set. The easiest wa
 full test matrix is:
 
 ```bash
-cargo xtask test
+cadmuscli test
 ```
 
 This sets `TEST_ROOT_DIR` automatically and runs tests across all feature combinations. To run
 a single feature combination:
 
 ```bash
-cargo xtask test --features "emulator + test"
+cadmuscli test --features "emulator + test"
 ```
 
-Or to run tests manually without xtask:
+Or to run tests manually without cadmuscli:
 
 ```bash
 TEST_ROOT_DIR=$(pwd) cargo test
@@ -190,10 +209,10 @@ cadmus-coverage-diff main         # or pass an explicit base branch
 
 `CADMUS_DEFAULT_BRANCH` defaults to `master`. Override it in `devenv.local.nix` if needed.
 
-Outside devenv, the equivalent xtask invocation is:
+Outside devenv, the equivalent cadmuscli invocation is:
 
 ```bash
-cargo xtask test --coverage --features emulator
+cadmuscli test --coverage --features emulator
 ```
 
 A device feature (`emulator`, `kobo`, or `deviceless`) is **required** to
@@ -273,10 +292,10 @@ TEST_ROOT_DIR=$(pwd) cargo test
 Custom SQLite has not been built yet. Inside `devenv shell`, run:
 
 ```bash
-cargo xtask setup
+cadmuscli setup
 ```
 
-Then retry the build or `cargo xtask run-emulator`.
+Then retry the build or `cadmuscli run-emulator`.
 
 ## Local Configuration
 
