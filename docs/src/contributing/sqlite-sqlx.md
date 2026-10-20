@@ -7,6 +7,20 @@ Cadmus uses [SQLite](https://sqlite.org) as its embedded database and
 SQLx provides **compile-time SQL verification** — every query is checked against
 the real schema before the code ships.
 
+## Runtime databases
+
+Cadmus opens two SQLite files beside each other:
+
+- `cadmus.sqlite` — library data, installed-dictionary metadata, integrity
+  checks, backups, and the library migrator.
+- `dictionary.sqlite` — the rebuildable word index only. Library integrity
+  checks and backups do not read this file. If connect or migrate fails, the
+  file and its `-wal`/`-shm` companions are deleted and opened again so the
+  index task can rebuild it.
+
+Installed-dictionary rows stay in the library database. The word index lives
+in `crates/core/dictionary/migrations/`.
+
 ## The `.sqlx` directory
 
 The `.sqlx/` directory at the repository root contains one JSON metadata file
@@ -26,15 +40,28 @@ types that SQLx inferred from the live database schema at the time
 After adding or changing any SQL query, regenerate the metadata:
 
 ```bash
-cargo sqlx prepare --all --workspace
+cargo xtask sqlx-prepare
 ```
 
-This connects to the database, re-introspects every query macro in the
-workspace, and rewrites the `.sqlx/` JSON files. Commit the updated files
-alongside your code change.
+The command creates a temporary SQLite file, applies `crates/core/migrations`
+with `sqlx migrate run`, then applies `crates/core/dictionary/migrations` with
+`sqlite3`. It runs `cargo sqlx prepare` against that file and rewrites
+`.sqlx/`. Commit the updated files alongside your code change.
+
+`cargo sqlx prepare` builds the crate once. Every `query!` macro in that build
+reads one database URL
+([sqlx#916](https://github.com/transact-rs/sqlx/issues/916)). Library queries
+and dictionary index queries both live in `cadmus-core`, so prepare cannot use
+the two runtime files as separate targets. The temporary file holds both
+schemas. The dictionary migrator does not run on it: both migrators record
+version 1 in `_sqlx_migrations`. The app still opens `dictionary.sqlite` at
+startup and migrates that file on its own.
+
+`DATABASE_URL` is not part of the devenv environment. Normal builds read
+`.sqlx/` because `SQLX_OFFLINE=true`.
 
 > [!IMPORTANT]
-> If you forget to run `cargo sqlx prepare`, the CI `check` job will fail
+> If you forget to run `cargo xtask sqlx-prepare`, the CI `check` job will fail
 > because the cached metadata will be out of date with your query changes.
 
 ## Compile-time SQL checking
@@ -47,13 +74,13 @@ compile time using the metadata in `.sqlx/`. This means:
 - Adding or removing a column in a migration without updating queries is caught
   **before deployment**.
 
-The macros require the `DATABASE_URL` environment variable to point at a live
-database when running `cargo sqlx prepare`, but **not** during regular `cargo
-build` or `cargo check` — those use the pre-generated `.sqlx/` files.
+Regular `cargo build` and `cargo check` do not open a database. They use the
+pre-generated `.sqlx/` files. `cargo xtask sqlx-prepare` is the command that
+talks to a live database.
 
 > [!IMPORTANT]
-> `.sqlx/` is only used when the `SQLX_OFFLINE=true` field is set which is
-> the default if you're using devenv.nix.
+> `.sqlx/` is only used when `SQLX_OFFLINE=true`, which devenv sets from
+> `.env`.
 
 ## Review rules
 

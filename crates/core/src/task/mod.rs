@@ -56,6 +56,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use sqlx::SqlitePool;
 use thiserror::Error;
 
 use crate::db::Database;
@@ -219,6 +220,8 @@ pub struct TaskManager {
     pending_thumbnail_indices: VecDeque<Option<usize>>,
     /// Events from naturally finished tasks, waiting to be sent.
     buffered_events: Vec<Event>,
+    /// Word-index pool passed in at startup. Reindex and USB unmount use it.
+    dictionary_pool: Option<SqlitePool>,
 }
 
 impl TaskManager {
@@ -229,6 +232,27 @@ impl TaskManager {
             pending_import_indices: VecDeque::new(),
             pending_thumbnail_indices: VecDeque::new(),
             buffered_events: Vec::new(),
+            dictionary_pool: None,
+        }
+    }
+
+    /// Closes the word-index pool so USB storage can take the data directory.
+    ///
+    /// Stops the indexer first so it does not keep using the pool after close.
+    /// USB unshare restarts the process, or reboots when `KoboRoot.tgz` is
+    /// present. The next startup opens `dictionary.sqlite` again.
+    #[cfg(feature = "kobo")]
+    pub(crate) async fn close_dictionary_index(&mut self) {
+        if let Err(error) = self.stop(&TaskId::DictionaryIndex).await
+            && !matches!(error, TaskError::NotRunning(TaskId::DictionaryIndex))
+        {
+            tracing::warn!(
+                error = %error,
+                "failed to stop dictionary_index before closing pool"
+            );
+        }
+        if let Some(pool) = &self.dictionary_pool {
+            pool.close().await;
         }
     }
 
@@ -445,13 +469,15 @@ impl TaskManager {
                 );
             }
             Event::ReindexDictionaries => {
-                self.schedule_dictionary_index(
-                    hub,
-                    &context.database,
-                    context.device.data_dir(),
-                    &context.inhibitor,
-                )
-                .await;
+                if let Some(pool) = self.dictionary_pool.clone() {
+                    self.schedule_dictionary_index(
+                        hub,
+                        &pool,
+                        context.device.data_dir(),
+                        &context.inhibitor,
+                    )
+                    .await;
+                }
             }
             Event::Device(DeviceEvent::NetUp) => {
                 #[cfg(feature = "kobo")]
@@ -545,7 +571,7 @@ impl TaskManager {
     fn schedule_dictionary_index<'a>(
         &'a mut self,
         hub: &'a crate::view::Hub,
-        database: &'a Database,
+        pool: &'a SqlitePool,
         data_path: std::path::PathBuf,
         inhibitor: &'a Arc<Inhibitor>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
@@ -560,7 +586,7 @@ impl TaskManager {
             self.flush_buffered_events(hub);
 
             let task = Box::new(dictionary_index::DictionaryIndexTask::new(
-                database.clone(),
+                pool.clone(),
                 data_path,
                 inhibitor.clone(),
             ));
@@ -765,16 +791,19 @@ impl Drop for TaskManager {
 /// - [`dbus_monitor::DbusMonitorTask`] - monitors D-Bus signals (test + kobo only, when `settings.logging.enable_dbus_log` is true)
 /// - [`import::ImportTask`] - runs an incremental import of all libraries on startup
 /// - [`dictionary_index::DictionaryIndexTask`] - indexes `.index` dictionary files into SQLite
-#[cfg_attr(feature = "tracing", tracing::instrument(skip(manager, hub, settings, database, data_path, install_dir, inhibitor), level = tracing::Level::TRACE))]
+#[cfg_attr(feature = "tracing", tracing::instrument(skip(manager, hub, context, dictionary_pool), level = tracing::Level::TRACE))]
 pub fn register_startup_tasks(
     manager: &mut TaskManager,
     hub: crate::view::Hub,
-    settings: &Settings,
-    database: &Database,
-    data_path: std::path::PathBuf,
-    install_dir: &std::path::Path,
-    inhibitor: &Arc<Inhibitor>,
+    context: &AppContext,
+    dictionary_pool: SqlitePool,
 ) {
+    manager.dictionary_pool = Some(dictionary_pool.clone());
+    let settings = &context.settings;
+    let database = &context.database;
+    let data_path = context.device.data_dir();
+    let install_dir = context.device.install_dir();
+    let inhibitor = &context.inhibitor;
     #[cfg(feature = "kobo")]
     {
         {
@@ -813,12 +842,12 @@ pub fn register_startup_tasks(
         &hub,
         database,
         settings,
-        install_dir,
+        &install_dir,
         inhibitor,
     );
 
     let task = Box::new(dictionary_index::DictionaryIndexTask::new(
-        database.clone(),
+        dictionary_pool,
         data_path,
         inhibitor.clone(),
     ));
@@ -926,6 +955,21 @@ mod tests {
     impl BackgroundTask for WaitingTask {
         fn id(&self) -> TaskId {
             TaskId::TestTask
+        }
+
+        async fn run(&mut self, _hub: &crate::view::Hub, cancel: &CancellationToken) {
+            sleep_unless_cancelled(cancel, Duration::from_secs(60)).await;
+        }
+    }
+
+    #[cfg(feature = "kobo")]
+    struct DictionaryIndexWait;
+
+    #[cfg(feature = "kobo")]
+    #[async_trait::async_trait]
+    impl BackgroundTask for DictionaryIndexWait {
+        fn id(&self) -> TaskId {
+            TaskId::DictionaryIndex
         }
 
         async fn run(&mut self, _hub: &crate::view::Hub, cancel: &CancellationToken) {
@@ -1496,5 +1540,34 @@ mod tests {
             thumbnail_was_scheduled(&mut manager, &hub, &mut rx, &context).await,
             "completed import must schedule thumbnail extraction"
         );
+    }
+
+    #[cfg(feature = "kobo")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_dictionary_index_stops_task_before_closing_pool() {
+        let mut manager = TaskManager::new();
+        let (hub, _rx) = crate::view::hub_channel();
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        manager.dictionary_pool = Some(pool.clone());
+        manager.start(Box::new(DictionaryIndexWait), hub).unwrap();
+        assert!(manager.is_running(&TaskId::DictionaryIndex));
+
+        manager.close_dictionary_index().await;
+
+        assert!(!manager.is_running(&TaskId::DictionaryIndex));
+        assert!(pool.is_closed());
+    }
+
+    #[cfg(feature = "kobo")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_dictionary_index_closes_pool_when_indexer_is_idle() {
+        let mut manager = TaskManager::new();
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        manager.dictionary_pool = Some(pool.clone());
+
+        manager.close_dictionary_index().await;
+
+        assert!(!manager.is_running(&TaskId::DictionaryIndex));
+        assert!(pool.is_closed());
     }
 }

@@ -18,11 +18,12 @@ use crate::version::get_current_version;
 /// The filename of the SQLite database used by Cadmus.
 pub const DB_FILENAME: &str = "cadmus.sqlite";
 
-/// Database handle over async SQLx.
+/// Connection to one SQLite file.
 ///
-/// Callers use `async` methods on the pool directly and `.await` them.
+/// The owner picks the path and the migrator. This type does not apply Cadmus
+/// startup policy (integrity, version gate, or backup).
 #[derive(Clone)]
-pub struct Database {
+pub(crate) struct SqliteFile {
     pool: SqlitePool,
     /// The path to the database file.
     db_path: PathBuf,
@@ -30,6 +31,119 @@ pub struct Database {
     ///
     /// Will be empty if the database path is in-memory or has no parent directory.
     db_dir: Option<PathBuf>,
+}
+
+impl SqliteFile {
+    /// Open `path` and a pool, creating missing parent directories.
+    ///
+    /// Does not migrate. The owner passes its own migrator to
+    /// [`SqliteFile::run_migrations`].
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(fields(db_path = %path.as_ref().display()))
+    )]
+    pub async fn connect<P: AsRef<Path> + std::fmt::Debug>(path: P) -> Result<Self, Error> {
+        let path = path.as_ref();
+        let db_dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf);
+
+        if let Some(dir) = &db_dir {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+
+        let path_str = path.display().to_string();
+
+        tracing::info!(db_path = %path_str, "connecting to database");
+
+        let pool = open_pool(path).await?;
+        tracing::info!(db_path = %path_str, "database connected");
+        Ok(SqliteFile {
+            pool,
+            db_path: path.to_path_buf(),
+            db_dir,
+        })
+    }
+
+    /// Borrow the pool so callers can query without owning the file.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self), level = tracing::Level::TRACE)
+    )]
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    /// Path of the file on disk.
+    ///
+    /// Restore and backup address the file after the pool is closed, so the path
+    /// has to outlive any one pool.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self), level = tracing::Level::TRACE)
+    )]
+    pub fn path(&self) -> &Path {
+        &self.db_path
+    }
+
+    /// Parent directory of the database file, when the path has one.
+    ///
+    /// In-memory databases have nowhere to put a backup, so callers must stop
+    /// when this is `None`.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self), level = tracing::Level::TRACE)
+    )]
+    pub fn dir(&self) -> Option<&Path> {
+        self.db_dir.as_deref()
+    }
+
+    /// Close every connection so the process releases the file.
+    ///
+    /// Required before unmount, and before a later step replaces the file.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self), fields(db_path = %self.db_path.display()))
+    )]
+    pub async fn close(&self) {
+        tracing::info!("closing database connection pool");
+        self.pool.close().await;
+        tracing::info!("database connection pool closed");
+    }
+
+    /// Open a new pool on the same path.
+    ///
+    /// The previous pool must already be closed. Restore uses this after it
+    /// replaces the file with a backup.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self), fields(db_path = %self.db_path.display()))
+    )]
+    pub async fn reopen(&mut self) -> Result<(), Error> {
+        self.pool = open_pool(&self.db_path).await?;
+        Ok(())
+    }
+
+    /// Apply `migrator` to this file.
+    ///
+    /// The migrator belongs to the caller, so this type is not tied to one schema.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self, migrator)))]
+    pub async fn run_migrations(&self, migrator: &sqlx::migrate::Migrator) -> Result<(), Error> {
+        migrator
+            .run(&self.pool)
+            .await
+            .context("failed to run database migrations")?;
+        Ok(())
+    }
+}
+
+/// Database handle over async SQLx.
+///
+/// Callers use `async` methods on the pool directly and `.await` them.
+#[derive(Clone)]
+pub struct Database {
+    file: SqliteFile,
 }
 
 impl std::fmt::Debug for Database {
@@ -51,26 +165,8 @@ impl Database {
     /// * `Err(Error)` - Connection failure
     #[cfg_attr(feature = "tracing", tracing::instrument(fields(db_path = %path.as_ref().display())))]
     pub async fn new<P: AsRef<Path> + std::fmt::Debug>(path: P) -> Result<Self, Error> {
-        let path = path.as_ref();
-        let db_dir = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(Path::to_path_buf);
-
-        if let Some(dir) = &db_dir {
-            tokio::fs::create_dir_all(dir).await?;
-        }
-
-        let path_str = path.display().to_string();
-
-        tracing::info!(db_path = %path_str, "connecting to database");
-
-        let pool = open_pool(path).await?;
-        tracing::info!(db_path = %path_str, "database connected");
-        Ok(Database {
-            pool,
-            db_path: path.to_path_buf(),
-            db_dir,
+        Ok(Self {
+            file: SqliteFile::connect(path).await?,
         })
     }
 
@@ -79,15 +175,27 @@ impl Database {
     /// After calling this, no further database operations should be performed.
     /// This must be called before unmounting the filesystem that contains the database file,
     /// to ensure SQLite releases all file descriptors and flushes any pending WAL data.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
     pub async fn close(&self) {
-        tracing::info!("closing database connection pool");
-        self.pool.close().await;
-        tracing::info!("database connection pool closed");
+        self.file.close().await;
     }
 
     /// Returns a reference to the SQLite connection pool.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self), level = tracing::Level::TRACE)
+    )]
     pub fn pool(&self) -> &SqlitePool {
-        &self.pool
+        self.file.pool()
+    }
+
+    /// Path of this library database, so a caller can place a sibling file beside it.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self), level = tracing::Level::TRACE)
+    )]
+    pub fn path(&self) -> &Path {
+        self.file.path()
     }
 
     /// Returns a `MigrationRunner` bound to this database's pool.
@@ -95,7 +203,7 @@ impl Database {
     /// Use this to execute all registered runtime migrations after the
     /// database is initialized.
     pub fn migration_runner(&self) -> migrations::MigrationRunner {
-        migrations::MigrationRunner::new(self.pool.clone())
+        migrations::MigrationRunner::new(self.file.pool().clone())
     }
 
     /// Initialises the database for use by the application.
@@ -120,8 +228,12 @@ impl Database {
 
         self.restore_if_needed(&app_version).await?;
         self.migrate(device, settings).await?;
-        version::stamp_db_version(&self.pool, &app_version, &version::current_migration_hash())
-            .await?;
+        version::stamp_db_version(
+            self.file.pool(),
+            &app_version,
+            &version::current_migration_hash(),
+        )
+        .await?;
         tracing::info!(app_version = %app_version, "database version stamped");
         self.create_version_backup(&app_version, backup_retention)
             .await?;
@@ -159,7 +271,7 @@ impl Database {
         let integrity = self.check_integrity().await;
 
         let gate = if integrity.is_ok() {
-            version::check_version_gate(&self.pool, app_version).await?
+            version::check_version_gate(self.file.pool(), app_version).await?
         } else {
             version::VersionGateResult::Unknown
         };
@@ -171,7 +283,7 @@ impl Database {
             return Ok(());
         }
 
-        let Some(ref db_dir) = self.db_dir.clone() else {
+        let Some(db_dir) = self.file.dir().map(Path::to_path_buf) else {
             if let Err(e) = integrity {
                 tracing::error!(
                     app_version = %app_version,
@@ -189,7 +301,7 @@ impl Database {
         };
 
         let db_version = if integrity.is_ok() {
-            version::read_db_version(&self.pool)
+            version::read_db_version(self.file.pool())
                 .await?
                 .unwrap_or_else(|| app_version.clone())
         } else {
@@ -209,8 +321,8 @@ impl Database {
             );
         }
 
-        let backup_manager = backup::DbBackupManager::new(db_dir.clone(), app_version.clone());
-        self.pool.close().await;
+        let backup_manager = backup::DbBackupManager::new(db_dir, app_version.clone());
+        self.file.pool().close().await;
 
         let restore_context = if integrity.is_err() {
             "corruption detected but no compatible backup found to restore"
@@ -219,14 +331,14 @@ impl Database {
         };
 
         let backup_path = backup_manager
-            .restore_best_backup(&self.db_path, &db_version)
+            .restore_best_backup(self.file.path(), &db_version)
             .await
             .map_err(|e| {
                 tracing::error!(app_version = %app_version, error = %e, restore_context, "restore failed");
                 Error::from(e).context(restore_context)
             })?;
 
-        self.pool = open_pool(&self.db_path).await?;
+        self.file.reopen().await?;
 
         tracing::info!(backup_path = %backup_path.display(), "database restored from backup");
 
@@ -243,7 +355,7 @@ impl Database {
         app_version: &crate::version::GitVersion,
         retention: usize,
     ) -> Result<(), Error> {
-        let Some(ref db_dir) = self.db_dir else {
+        let Some(db_dir) = self.file.dir().map(Path::to_path_buf) else {
             return Ok(());
         };
 
@@ -256,9 +368,9 @@ impl Database {
             return Ok(());
         }
 
-        let backup_manager = backup::DbBackupManager::new(db_dir.clone(), app_version.clone());
+        let backup_manager = backup::DbBackupManager::new(db_dir, app_version.clone());
         backup_manager
-            .create_backup(&self.pool, &self.db_path, retention)
+            .create_backup(self.file.pool(), self.file.path(), retention)
             .await?;
 
         Ok(())
@@ -269,7 +381,8 @@ impl Database {
     async fn migrate(&mut self, device: &AppDevice, settings: &mut Settings) -> Result<(), Error> {
         tracing::info!("running schema migrations");
         {
-            let migrations = sqlx::migrate!("./migrations").run(&self.pool);
+            let migrator = sqlx::migrate!("./migrations");
+            let migrations = self.file.run_migrations(&migrator);
             #[cfg(feature = "tracing")]
             let migrations = {
                 use tracing::Instrument as _;
@@ -280,6 +393,42 @@ impl Database {
 
         tracing::info!("running runtime migrations");
         self.migration_runner().run_all(device, settings).await?;
+        self.reclaim_free_pages().await?;
+
+        Ok(())
+    }
+
+    /// Reclaims free pages left by `DROP TABLE` so the next backup does not
+    /// copy them.
+    ///
+    /// `PRAGMA page_count`, `PRAGMA freelist_count`, and `VACUUM` are not in
+    /// the offline query cache. Typed `query_scalar!` cannot describe them, so
+    /// this uses untyped [`sqlx::query`] and [`sqlx::query_scalar`] the same
+    /// way [`Database::check_integrity`] does for `PRAGMA wal_checkpoint`.
+    ///
+    /// In-memory databases have no file to shrink, so they return immediately.
+    /// `VACUUM` failure is logged and ignored; a failed page-count read is
+    /// returned.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
+    async fn reclaim_free_pages(&self) -> Result<(), Error> {
+        if self.file.dir().is_none() {
+            return Ok(());
+        }
+
+        let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(self.file.pool())
+            .await
+            .context("failed to read PRAGMA page_count")?;
+        let freelist_count: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+            .fetch_one(self.file.pool())
+            .await
+            .context("failed to read PRAGMA freelist_count")?;
+
+        if freelist_count.saturating_mul(2) > page_count
+            && let Err(error) = sqlx::query("VACUUM").execute(self.file.pool()).await
+        {
+            tracing::warn!(error = %error, "failed to vacuum library database");
+        }
 
         Ok(())
     }
@@ -301,12 +450,12 @@ impl Database {
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
     async fn check_integrity(&self) -> Result<(), Error> {
         sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&self.pool)
+            .execute(self.file.pool())
             .await
             .context("failed to run PRAGMA wal_checkpoint")?;
 
         let result: Option<String> = sqlx::query_scalar!("PRAGMA quick_check")
-            .fetch_one(&self.pool)
+            .fetch_one(self.file.pool())
             .await
             .context("failed to run PRAGMA quick_check")?;
 
@@ -388,7 +537,7 @@ mod tests {
         let result: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='books'",
         )
-        .fetch_one(&db.pool)
+        .fetch_one(db.pool())
         .await
         .expect("failed to query sqlite_master");
         assert_eq!(result.0, 1, "books table should exist after migrations");
@@ -401,7 +550,7 @@ mod tests {
             .expect("failed to create in-memory database");
         db.init_for_test(0).await.expect("failed to run migrations");
 
-        let version = version::read_db_version(&db.pool).await.unwrap();
+        let version = version::read_db_version(db.pool()).await.unwrap();
         assert_eq!(
             version,
             Some(get_current_version()),
@@ -419,7 +568,7 @@ mod tests {
             .await
             .expect("second migrate should succeed (Current path)");
 
-        let version = version::read_db_version(&db.pool).await.unwrap();
+        let version = version::read_db_version(db.pool()).await.unwrap();
         assert_eq!(version, Some(get_current_version()));
     }
 
@@ -432,7 +581,7 @@ mod tests {
 
         let older = crate::version::GitVersion::parse("v0.0.1").unwrap();
         let migration_hash = version::current_migration_hash();
-        version::stamp_db_version(&db.pool, &older, &migration_hash)
+        version::stamp_db_version(db.pool(), &older, &migration_hash)
             .await
             .unwrap();
 
@@ -440,7 +589,7 @@ mod tests {
             .await
             .expect("migrate should succeed (Upgrade path)");
 
-        let version = version::read_db_version(&db.pool).await.unwrap();
+        let version = version::read_db_version(db.pool()).await.unwrap();
         assert_eq!(
             version,
             Some(get_current_version()),
@@ -457,7 +606,7 @@ mod tests {
 
         let newer = crate::version::GitVersion::parse("v99.99.99").unwrap();
         let migration_hash = incompatible_migration_hash();
-        version::stamp_db_version(&db.pool, &newer, &migration_hash)
+        version::stamp_db_version(db.pool(), &newer, &migration_hash)
             .await
             .unwrap();
 
@@ -487,7 +636,7 @@ mod tests {
 
         let newer = crate::version::GitVersion::parse("v99.99.99").unwrap();
         let migration_hash = incompatible_migration_hash();
-        version::stamp_db_version(&db.pool, &newer, &migration_hash)
+        version::stamp_db_version(db.pool(), &newer, &migration_hash)
             .await
             .unwrap();
 
@@ -519,13 +668,13 @@ mod tests {
         let backup_manager =
             backup::DbBackupManager::new(dir.path().to_path_buf(), app_version.clone());
         backup_manager
-            .create_backup(&db.pool, &db_path, 2)
+            .create_backup(db.pool(), &db_path, 2)
             .await
             .unwrap();
 
         let newer = crate::version::GitVersion::parse("v99.99.99").unwrap();
         let migration_hash = incompatible_migration_hash();
-        version::stamp_db_version(&db.pool, &newer, &migration_hash)
+        version::stamp_db_version(db.pool(), &newer, &migration_hash)
             .await
             .unwrap();
 
@@ -533,7 +682,7 @@ mod tests {
             .await
             .expect("migrate should succeed on downgrade with db_dir (restore path)");
 
-        let version = version::read_db_version(&db.pool).await.unwrap();
+        let version = version::read_db_version(db.pool()).await.unwrap();
         assert_eq!(
             version,
             Some(get_current_version()),
@@ -562,6 +711,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reclaim_free_pages_on_fresh_file_returns_ok() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cadmus.sqlite");
+        let mut db = Database::new(&db_path)
+            .await
+            .expect("failed to create database");
+        db.init_for_test(0).await.expect("failed to run migrations");
+        db.reclaim_free_pages()
+            .await
+            .expect("reclaim on a fresh file database");
+    }
+
+    #[tokio::test]
+    async fn reclaim_free_pages_shrinks_a_freelist_heavy_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cadmus.sqlite");
+        let mut db = Database::new(&db_path)
+            .await
+            .expect("failed to create database");
+        db.init_for_test(0).await.expect("failed to run migrations");
+
+        sqlx::query("CREATE TABLE reclaim_pad (blob BLOB)")
+            .execute(db.pool())
+            .await
+            .expect("create pad");
+        sqlx::query("INSERT INTO reclaim_pad (blob) VALUES (zeroblob(1048576))")
+            .execute(db.pool())
+            .await
+            .expect("pad");
+        sqlx::query("DROP TABLE reclaim_pad")
+            .execute(db.pool())
+            .await
+            .expect("drop pad");
+
+        let before: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(db.pool())
+            .await
+            .expect("page_count before");
+        db.reclaim_free_pages().await.expect("reclaim");
+        let after: i64 = sqlx::query_scalar("PRAGMA page_count")
+            .fetch_one(db.pool())
+            .await
+            .expect("page_count after");
+
+        assert!(after < before);
+    }
+
+    #[tokio::test]
     async fn test_init_restores_backup_on_corruption() {
         let dir = tempfile::Builder::new()
             .prefix("cadmus-corruption-restore-")
@@ -580,11 +777,11 @@ mod tests {
         let backup_manager =
             backup::DbBackupManager::new(dir.path().to_path_buf(), app_version.clone());
         backup_manager
-            .create_backup(&db.pool, &db_path, 2)
+            .create_backup(db.pool(), &db_path, 2)
             .await
             .unwrap();
 
-        db.pool.close().await;
+        db.pool().close().await;
 
         {
             let mut bytes = std::fs::read(&db_path).expect("failed to read db file");
@@ -601,7 +798,7 @@ mod tests {
             .await
             .expect("init should restore from backup on corruption");
 
-        let version = version::read_db_version(&db.pool).await.unwrap();
+        let version = version::read_db_version(db.pool()).await.unwrap();
         assert_eq!(
             version,
             Some(get_current_version()),
@@ -622,7 +819,7 @@ mod tests {
             .expect("failed to create database");
         db.init_for_test(0).await.expect("failed to run migrations");
 
-        db.pool.close().await;
+        db.pool().close().await;
 
         {
             let mut bytes = std::fs::read(&db_path).expect("failed to read db file");
