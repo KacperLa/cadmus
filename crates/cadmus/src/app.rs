@@ -13,7 +13,7 @@ use cadmus_core::device::rtc::shutdown_rtc;
 use cadmus_core::device::wifi::WifiManager;
 use cadmus_core::device::{
     DeviceIdentity, DeviceInput, DeviceLifecycle, DevicePaths, DeviceRuntime, DeviceTask,
-    ExitStatus, HistoryItem, InputSource,
+    EventOutcome, ExitStatus, HistoryItem, InputSource,
 };
 use cadmus_core::document::sys_info_as_html;
 use cadmus_core::font::Fonts;
@@ -30,6 +30,7 @@ use cadmus_core::metadata::Info;
 use cadmus_core::settings::versioned::SettingsManager;
 use cadmus_core::settings::{ButtonScheme, Settings, StartupMode};
 use cadmus_core::task::TaskManager;
+use cadmus_core::unix_signals::UnixSignals;
 use cadmus_core::version::{get_current_version, get_version};
 use cadmus_core::view::HubReceiver;
 use cadmus_core::view::calculator::Calculator;
@@ -167,15 +168,30 @@ async fn stop_producers_and_drain(
 /// `Quit` mapping still run. Any other event can only mutate UI or platform state
 /// that teardown is already dismantling, so it is dropped rather than replayed.
 fn is_shutdown_related_event(evt: &Event) -> bool {
+    matches!(evt, Event::CheckBattery) || is_exit_intent(evt)
+}
+
+/// Whether an event asks the process to exit.
+///
+/// The device can refuse these while the Full inhibit is held, so the caller
+/// has to tell a refused exit from an accepted one.
+fn is_exit_intent(evt: &Event) -> bool {
     matches!(
         evt,
-        Event::CheckBattery
-            | Event::Quit
+        Event::Quit
             | Event::Select(EntryId::PowerOff)
             | Event::Select(EntryId::Restart)
             | Event::Select(EntryId::Reboot)
             | Event::Select(EntryId::Quit)
     )
+}
+
+/// Whether the device swallowed an exit intent instead of leaving.
+///
+/// [`Event::CheckBattery`] is not an exit intent, so a routine battery check
+/// must never re-arm the signal listener.
+fn exit_was_refused(evt: &Event, outcome: &EventOutcome) -> bool {
+    is_exit_intent(evt) && !matches!(outcome, EventOutcome::Exit(_))
 }
 
 /// Exit intents queued during shutdown. Higher precedence wins when several are
@@ -462,6 +478,8 @@ pub async fn run() -> Result<(), Error> {
 
     let mut exit_status = ExitStatus::Quit;
 
+    let mut unix_signals = UnixSignals::install();
+
     let mut device = AppDevice::from_environment()
         .await
         .expect("failed to initialize device");
@@ -567,6 +585,7 @@ pub async fn run() -> Result<(), Error> {
         context.settings.button_scheme,
         std::sync::Arc::clone(&context.inhibitor),
     );
+    unix_signals.attach(tx.clone());
 
     let mut tasks: Vec<DeviceTask> = Vec::new();
     let mut background_tasks = TaskManager::new();
@@ -719,6 +738,11 @@ pub async fn run() -> Result<(), Error> {
         #[cfg(not(feature = "tracing"))]
         let device_outcome =
             AppDevice::handle_event(&evt, &tx, &mut bus, &mut rq, &mut context, &mut runtime).await;
+
+        if exit_was_refused(&evt, &device_outcome) {
+            unix_signals.reset();
+        }
+
         match device_outcome {
             cadmus_core::device::EventOutcome::Handled => {
                 process_render_queue(view.as_mut(), &mut rq, &mut context, &mut updating);
@@ -1194,6 +1218,9 @@ pub async fn run() -> Result<(), Error> {
         drain_bus(&mut bus, &tx);
     }
 
+    unix_signals.stop().await;
+    UnixSignals::restore_default_termination();
+
     let _shutdown_wake = match context
         .inhibitor
         .acquire(Kind::SoftSuspend, SoftSuspendName::Shutdown)
@@ -1292,5 +1319,32 @@ mod tests {
         assert!(!is_shutdown_related_event(&Event::PrepareShare));
         assert!(!is_shutdown_related_event(&Event::Share));
         assert!(!is_shutdown_related_event(&Event::ToggleFrontlight));
+    }
+
+    #[test]
+    fn is_exit_intent_covers_quit_paths() {
+        assert!(!is_exit_intent(&Event::CheckBattery));
+        assert!(is_exit_intent(&Event::Select(EntryId::Quit)));
+        assert!(is_exit_intent(&Event::Select(EntryId::Restart)));
+        assert!(is_exit_intent(&Event::Select(EntryId::PowerOff)));
+        assert!(is_exit_intent(&Event::Select(EntryId::Reboot)));
+        assert!(is_exit_intent(&Event::Quit));
+    }
+
+    #[test]
+    fn exit_was_refused_table() {
+        let cases = [
+            (Event::CheckBattery, EventOutcome::Handled, false),
+            (Event::Select(EntryId::Quit), EventOutcome::Handled, true),
+            (
+                Event::Select(EntryId::Quit),
+                EventOutcome::Exit(ExitStatus::Quit),
+                false,
+            ),
+            (Event::Select(EntryId::Restart), EventOutcome::Handled, true),
+        ];
+        for (evt, outcome, expected) in cases {
+            assert_eq!(exit_was_refused(&evt, &outcome), expected);
+        }
     }
 }
