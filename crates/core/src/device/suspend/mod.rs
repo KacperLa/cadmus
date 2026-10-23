@@ -58,9 +58,15 @@
 //! [`Context::deferred_suspend`](crate::context::Context::deferred_suspend)
 //! and returns. When the last Full holder drops, Kobo posts
 //! [`Event::FullInhibitCleared`](crate::view::Event::FullInhibitCleared) and
-//! the orchestrator flushes that intent. OTA success sends
+//! the orchestrator flushes that intent: Auto origin rechecks Sleep via
+//! [`start_cycle_from_auto`](orchestrator::start_cycle_from_auto); Explicit
+//! origin still runs `start_cycle`. OTA success sends
 //! [`Event::ClearDeferredSuspend`](crate::view::Event::ClearDeferredSuspend)
 //! first so reboot is not raced by a flush.
+//!
+//! [`crate::device::inhibitor::Kind::Sleep`] defers only the Auto Suspend path
+//! ([`start_cycle_from_auto`](orchestrator::start_cycle_from_auto)). Explicit
+//! `start_cycle` still runs. Last Sleep drop does not flush deferred suspend.
 //!
 //! [`crate::device::reschedule_auto_suspend_alarm`] also clears deferred
 //! intent (user activity) without starting a cycle.
@@ -78,8 +84,8 @@ pub(crate) use cycle::SuspendCycle;
 pub(crate) use helpers::has_task;
 pub(crate) use helpers::{cancel_suspend_if_pending, is_suspend_active};
 pub(crate) use orchestrator::{
-    clear_deferred_suspend, handle_event, is_suspend_rtc_pending, is_suspend_rtc_pending_in,
-    show_power_off_intermission, start_cycle,
+    DeferredSuspend, clear_deferred_suspend, handle_event, is_suspend_rtc_pending,
+    is_suspend_rtc_pending_in, show_power_off_intermission, start_cycle,
 };
 #[cfg(test)]
 pub(crate) use wake::PollResult;
