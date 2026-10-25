@@ -1,19 +1,12 @@
-//! [`Html5Document`] — an HTML document backed by the html5ever parser.
+//! [`XhtmlDocument`] — an in-memory XHTML document backed by xml5ever.
 //!
-//! This module exposes a single public type, [`Html5Document`], which wraps
-//! the shared [`HtmlBase`] rendering pipeline and uses [`parse_html5`] to
-//! build the document tree.
-//!
-//! Use [`Html5Document`] when HTML5 conformance matters more than offset
-//! precision — for example, the dictionary view, which renders content from
-//! third-party dictionaries that may contain entities, void elements, and
-//! implicitly-closed tags. Because node offsets are synthetic (not byte
-//! positions), reading positions must **not** be persisted when using this
-//! type.
+//! Wraps the shared [`HtmlBase`] rendering pipeline and uses
+//! [`parse_xml_fragment`] to build the document tree, because dictionary
+//! snippets need not have a single root. Used for ephemeral rendering.
 
 use super::HtmlBase;
 use super::layout::TextAlign;
-use super::xml::parse_html5;
+use super::xml::parse_xml_fragment;
 use crate::document::{BoundedText, Document, Location, TocEntry};
 use crate::framebuffer::Pixmap;
 use crate::geom::{Boundary, CycleDir};
@@ -25,35 +18,27 @@ const VIEWER_STYLESHEET: &str = "css/dictionary.css";
 /// Default user-editable stylesheet for dictionary rendering.
 const USER_STYLESHEET: &str = "css/dictionary-user.css";
 
-/// HTML document backed by the html5ever spec-compliant parser.
-///
-/// Handles HTML entities, void elements (`<br>`, `<img>`), and implicitly-
-/// closed block tags correctly per the HTML5 spec. Node offsets are **synthetic**
-/// (not byte positions in the source), so this type is **not** suitable for
-/// persisting reading positions to disk. Use it for ephemeral rendering such
-/// as the dictionary view.
-///
-/// For documents where offset accuracy matters (EPUB spine chapters, standalone
-/// HTML files) use [`HtmlDocument`](super::HtmlDocument) instead.
-pub struct Html5Document {
+/// In-memory XHTML document parsed with xml5ever.
+pub struct XhtmlDocument {
     /// Shared rendering state (tree, engine, page cache, stylesheets).
     pub(super) base: HtmlBase,
 }
 
-unsafe impl Send for Html5Document {}
-unsafe impl Sync for Html5Document {}
+unsafe impl Send for XhtmlDocument {}
+unsafe impl Sync for XhtmlDocument {}
 
-impl Html5Document {
-    /// Parses an in-memory HTML string using html5ever and returns a
+impl XhtmlDocument {
+    /// Parses an in-memory XHTML string using xml5ever and returns a
     /// ready-to-render document.
     ///
     /// Defaults to the dictionary viewer and user stylesheets; call
     /// [`set_viewer_stylesheet`](Self::set_viewer_stylesheet) and
     /// [`set_user_stylesheet`](Self::set_user_stylesheet) to override them.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(text), fields(len = text.len())))]
-    pub fn new_from_memory(text: &str, install_dir: &Path) -> Html5Document {
-        let content = parse_html5(text);
-        Html5Document {
+    pub fn new_from_memory(text: &str, install_dir: &Path) -> XhtmlDocument {
+        let mut content = parse_xml_fragment(text);
+        content.wrap_lost_inlines();
+        XhtmlDocument {
             base: HtmlBase::new(
                 content,
                 text.len(),
@@ -70,7 +55,9 @@ impl Html5Document {
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self, text), fields(len = text.len())))]
     pub fn update(&mut self, text: &str) {
         self.base.size = text.len();
-        self.base.content = parse_html5(text);
+        let mut content = parse_xml_fragment(text);
+        content.wrap_lost_inlines();
+        self.base.content = content;
         self.base.pages.clear();
     }
 
@@ -87,7 +74,7 @@ impl Html5Document {
     }
 }
 
-impl Document for Html5Document {
+impl Document for XhtmlDocument {
     /// Returns the current page dimensions in pixels as `(width, height)`.
     #[inline]
     fn dims(&self, _index: usize) -> Option<(f32, f32)> {
@@ -210,7 +197,7 @@ impl Document for Html5Document {
         self.base.metadata(key)
     }
 
-    /// No-op; `Html5Document` is always constructed from memory and has no
+    /// No-op; `XhtmlDocument` is always constructed from memory and has no
     /// file path to save to.
     fn save(&self, _path: &str) -> Result<(), Error> {
         Ok(())

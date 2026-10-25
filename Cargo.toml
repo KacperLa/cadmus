@@ -52,6 +52,10 @@ rustdoc.private_intra_doc_links = "allow"
 await_holding_lock = "deny"
 await_holding_refcell_ref = "deny"
 
+[patch.crates-io]
+markup5ever = { path = "thirdparty/html5ever/markup5ever" }
+xml5ever = { path = "thirdparty/html5ever/xml5ever" }
+
 [profile.release-minsized]
 inherits = "release"
 panic = "abort"

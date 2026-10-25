@@ -16,7 +16,6 @@ use self::pdf::PdfOpener;
 use crate::document::file_extension::FileExtension;
 use crate::framebuffer::Pixmap;
 use crate::geom::{Boundary, CycleDir};
-use crate::helpers::decode_entities;
 use crate::metadata::{Annotation, TextAlign};
 use crate::settings::INTERNAL_CARD_ROOT;
 use crate::version::get_version;
@@ -50,11 +49,13 @@ impl Href {
         &self.0
     }
 
-    /// Percent-decodes the href after expanding XML entities.
+    /// Percent-decodes the href.
+    ///
+    /// An [`Href`] always comes from an attribute value the XML parser already
+    /// decoded, so expanding character references here would turn a literal
+    /// `&amp;` in a file name into `&` and point at the wrong archive entry.
     pub fn decoded(&self) -> String {
-        percent_decode_str(&decode_entities(&self.0))
-            .decode_utf8_lossy()
-            .into_owned()
+        percent_decode_str(&self.0).decode_utf8_lossy().into_owned()
     }
 }
 
@@ -201,6 +202,16 @@ pub trait Document: Send + Sync {
     }
 }
 
+/// Size of the file at `path` in bytes, or `0` when it cannot be read.
+///
+/// Used for telemetry only, so a failed metadata call must not stop a document
+/// from opening.
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|meta| meta.len())
+        .unwrap_or_default()
+}
+
 pub fn file_kind<P: AsRef<Path>>(path: P) -> Option<FileExtension> {
     path.as_ref()
         .extension()
@@ -284,9 +295,21 @@ pub fn asciify(name: &str) -> String {
         .replace('’', "'")
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(skip(path, install_dir), fields(path = %path.as_ref().display())))]
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip(path, install_dir),
+        fields(path = %path.as_ref().display(), bytes = file_size(path.as_ref()))
+    )
+)]
 pub fn open<P: AsRef<Path>>(path: P, install_dir: &Path) -> Option<Box<dyn Document>> {
-    tracing::trace!(path = %path.as_ref().display() , install_dir = %install_dir.display(), "Opening document");
+    let bytes = file_size(path.as_ref());
+    tracing::debug!(
+        path = %path.as_ref().display(),
+        bytes,
+        install_dir = %install_dir.display(),
+        "Opening document"
+    );
 
     let kind = file_kind(path.as_ref());
     if kind.is_none() {
@@ -774,9 +797,13 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn href_decoded_expands_percent_encoding_and_entities() {
+    fn href_decoded_expands_percent_encoding_only() {
         assert_eq!(Href::from("chap%20one.xhtml").decoded(), "chap one.xhtml");
-        assert_eq!(Href::from("a&amp;b.xhtml").decoded(), "a&b.xhtml");
+        assert_eq!(
+            Href::from("a&amp;b.xhtml").decoded(),
+            "a&amp;b.xhtml",
+            "entity-looking names must survive: the parser decoded them already"
+        );
     }
 
     #[test]

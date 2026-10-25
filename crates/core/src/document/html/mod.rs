@@ -3,14 +3,13 @@
 //! This module provides two concrete document types that share a common
 //! rendering pipeline through [`HtmlBase`]:
 //!
-//! - [`HtmlDocument`] — backed by the hand-rolled [`XmlParser`]. Node offsets
-//!   are exact byte positions in the source string, which is required when
-//!   reading positions, bookmarks, and annotations are persisted to disk.
-//!   Used for standalone HTML files and EPUB spine chapters.
+//! - [`HtmlDocument`] — backed by xml5ever (XHTML). Node offsets are
+//!   byte-accurate source positions, which is required when reading positions,
+//!   bookmarks, and annotations are persisted to disk. Used for standalone
+//!   HTML files and EPUB spine chapters.
 //!
-//! - [`Html5Document`] — backed by html5ever. Node offsets are synthetic.
-//!   Used for ephemeral rendering (e.g. the dictionary view) where HTML5
-//!   conformance matters more than offset precision.
+//! - [`XhtmlDocument`] — also backed by xml5ever. Used for ephemeral
+//!   rendering where no positions are persisted (e.g. the dictionary view).
 //!
 //! The shared [`HtmlBase`] struct holds the parsed [`XmlTree`], the layout
 //! [`Engine`], the page cache, and stylesheet paths. Both document types
@@ -19,13 +18,13 @@
 pub mod css;
 pub mod dom;
 pub mod engine;
-pub mod html5;
 pub mod layout;
 pub mod parse;
 pub mod style;
+pub mod xhtml;
 pub mod xml;
 
-pub use html5::Html5Document;
+pub use xhtml::XhtmlDocument;
 
 use self::css::CssParser;
 use self::dom::{NodeRef, XmlTree};
@@ -33,7 +32,7 @@ use self::engine::{Engine, Page, ResourceFetcher};
 use self::layout::{DrawCommand, ImageCommand, TextAlign, TextCommand};
 use self::layout::{DrawState, LoopContext, RootData, StyleData};
 use self::style::StyleSheet;
-use self::xml::XmlParser;
+use self::xml::parse_xml_fragment;
 use crate::document::{BoundedText, Document, Location, TextLocation, TocEntry};
 use crate::framebuffer::Pixmap;
 use crate::geom::{Boundary, CycleDir, Edge};
@@ -55,7 +54,7 @@ const USER_STYLESHEET: &str = "css/html-user.css";
 type UriCache = FxHashMap<String, usize>;
 
 /// Parser-independent rendering state shared by [`HtmlDocument`] and
-/// [`Html5Document`].
+/// [`XhtmlDocument`].
 ///
 /// Owns the parsed [`XmlTree`], the layout [`Engine`], a lazily-built page
 /// cache, and the stylesheet configuration. Neither parser-specific logic nor
@@ -156,6 +155,10 @@ impl HtmlBase {
     /// Recursively walks the tree rooted at `node` and inserts an entry into
     /// `cache` for every element that carries an `id` attribute, mapping
     /// `"name#id"` to the element's offset.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self, node, cache), fields(name))
+    )]
     fn cache_uris(&mut self, node: NodeRef, name: &str, cache: &mut UriCache) {
         if let Some(id) = node.attribute("id") {
             cache.insert(format!("{}#{}", name, id), node.offset());
@@ -456,11 +459,11 @@ impl ResourceFetcher for PathBuf {
     }
 }
 
-/// HTML document backed by the hand-rolled [`XmlParser`].
+/// HTML document backed by xml5ever.
 ///
-/// Node offsets are exact byte positions in the source string, making this
-/// suitable for EPUB spine chapters and standalone HTML files where reading
-/// positions are persisted to disk as absolute byte offsets.
+/// Node offsets are byte-accurate source positions, making this suitable for
+/// standalone HTML files where reading positions are persisted to disk as
+/// absolute byte offsets.
 pub struct HtmlDocument {
     /// The raw source text, retained so that [`Document::save`] can write it
     /// back to disk unchanged.
@@ -473,15 +476,19 @@ unsafe impl Send for HtmlDocument {}
 unsafe impl Sync for HtmlDocument {}
 
 impl HtmlDocument {
-    /// Opens the file at `path`, parses it with [`XmlParser`], and returns a
+    /// Opens the file at `path`, parses it with xml5ever, and returns a
     /// ready-to-render document.
+    ///
+    /// Parsed as a fragment: standalone HTML files are often not wrapped in a
+    /// single `<html>` root, so sibling top-level elements and loose top-level
+    /// text must all be kept.
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(path), fields(path = %path.as_ref().display())))]
     pub fn new<P: AsRef<Path>>(path: P, install_dir: &Path) -> Result<HtmlDocument, Error> {
         let mut file = File::open(&path)?;
         let size = file.metadata()?.len() as usize;
         let mut text = String::new();
         file.read_to_string(&mut text)?;
-        let mut content = XmlParser::new(&text).parse();
+        let mut content = parse_xml_fragment(&text);
         content.wrap_lost_inlines();
         let parent = path.as_ref().parent().unwrap_or_else(|| Path::new(""));
 
@@ -505,7 +512,7 @@ impl HtmlDocument {
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(text), fields(len = text.len())))]
     pub fn new_from_memory(text: &str, install_dir: &Path) -> HtmlDocument {
         let size = text.len();
-        let mut content = XmlParser::new(text).parse();
+        let mut content = parse_xml_fragment(text);
         content.wrap_lost_inlines();
 
         HtmlDocument {
@@ -526,8 +533,9 @@ impl HtmlDocument {
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self, text), fields(len = text.len())))]
     pub fn update(&mut self, text: &str) {
         self.base.size = text.len();
-        self.base.content = XmlParser::new(text).parse();
-        self.base.content.wrap_lost_inlines();
+        let mut content = parse_xml_fragment(text);
+        content.wrap_lost_inlines();
+        self.base.content = content;
         self.text = text.to_string();
         self.base.pages.clear();
     }
@@ -740,6 +748,67 @@ mod tests {
         doc.base.engine.set_margin_width(margin_width);
         doc.base.engine.load_fonts_from(root_dir);
         doc
+    }
+
+    /// Non-whitespace text of every element with `tag_name`, in document order.
+    fn element_texts(doc: &HtmlDocument, tag_name: &str) -> Vec<String> {
+        doc.base
+            .content
+            .root()
+            .descendants()
+            .filter(|n| n.tag_name() == Some(tag_name))
+            .map(|n| n.text())
+            .collect()
+    }
+
+    #[test]
+    fn document_keeps_sibling_top_level_elements() {
+        let doc = HtmlDocument::new_from_memory("<h1>Title</h1><p>Body</p>", Path::new(""));
+
+        assert_eq!(element_texts(&doc, "h1"), vec!["Title".to_string()]);
+        assert_eq!(element_texts(&doc, "p"), vec!["Body".to_string()]);
+    }
+
+    #[test]
+    fn document_without_html_root_keeps_head_and_body() {
+        let html = concat!(
+            "<head><title>Cover</title></head>",
+            "<body><h1>Title</h1><p>Body</p></body>",
+        );
+        let doc = HtmlDocument::new_from_memory(html, Path::new(""));
+
+        assert_eq!(element_texts(&doc, "title"), vec!["Cover".to_string()]);
+        assert_eq!(element_texts(&doc, "h1"), vec!["Title".to_string()]);
+        assert_eq!(element_texts(&doc, "p"), vec!["Body".to_string()]);
+    }
+
+    #[test]
+    fn document_keeps_text_after_last_top_level_element() {
+        let doc = HtmlDocument::new_from_memory("<p>x</p> tail", Path::new(""));
+
+        assert_eq!(element_texts(&doc, "p"), vec!["x".to_string()]);
+        assert_eq!(doc.base.content.root().text(), "x tail");
+    }
+
+    #[test]
+    fn document_from_path_keeps_sibling_top_level_elements() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("book.html");
+        fs::write(&path, "<h1>Title</h1><p>Body</p>").expect("write html");
+
+        let doc = HtmlDocument::new(&path, Path::new("")).expect("parse html");
+
+        assert_eq!(element_texts(&doc, "h1"), vec!["Title".to_string()]);
+        assert_eq!(element_texts(&doc, "p"), vec!["Body".to_string()]);
+    }
+
+    #[test]
+    fn update_keeps_sibling_top_level_elements() {
+        let mut doc = HtmlDocument::new_from_memory("<p>old</p>", Path::new(""));
+        doc.update("<h1>Title</h1><p>Body</p>");
+
+        assert_eq!(element_texts(&doc, "h1"), vec!["Title".to_string()]);
+        assert_eq!(element_texts(&doc, "p"), vec!["Body".to_string()]);
     }
 
     #[test]
